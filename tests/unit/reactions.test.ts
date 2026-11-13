@@ -44,16 +44,16 @@ console.log('\n# 私聊里有人点了 ❤️');
 {
   const update = {
     className: 'UpdateMessageReactions',
-    peer: { userId: 5064811594 },
+    peer: { userId: 123456789 },
     msgId: 270,
     reactions: { results: [emoji('❤')] },
-    recentReactions: [{ userId: 5064811594 }],
+    recentReactions: [{ userId: 123456789 }],
   };
   const parsed = parseReactionUpdate(update, resolve);
-  eq('会话 id', parsed?.chatId, 5064811594);
+  eq('会话 id', parsed?.chatId, 123456789);
   eq('会话类型', parsed?.chatKind, 'user');
   eq('消息 id', parsed?.messageId, 270);
-  eq('谁点的', parsed?.userId, 5064811594);
+  eq('谁点的', parsed?.userId, 123456789);
   eq('表情', parsed?.emoticons, ['❤']);
   eq('不是取消', parsed?.removed, false);
 }

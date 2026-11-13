@@ -71,14 +71,14 @@ try {
   {
     const log = new AuditLog(file, false);
     log.setEnabled(true);
-    log.write({ tool: 'telegram_send_message', result: 'done', chatId: 5064811594, outcome: '已发送' });
+    log.write({ tool: 'telegram_send_message', result: 'done', chatId: 123456789, outcome: '已发送' });
     log.write({ tool: 'telegram_delete_messages', result: 'denied' });
     const lines = readFileSync(file, 'utf8').trim().split('\n');
     eq('两行', lines.length, 2);
     const first = JSON.parse(lines[0]!) as Record<string, unknown>;
     eq('工具名', first.tool, 'telegram_send_message');
     eq('结果', first.result, 'done');
-    eq('会话 id', first.chat_id, 5064811594);
+    eq('会话 id', first.chat_id, 123456789);
     ok('有时间戳', typeof first.ts === 'string' && first.ts.includes('T'));
     ok('不带 api_hash 字段', !('api_hash' in first));
   }

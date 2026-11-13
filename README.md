@@ -1,7 +1,7 @@
 # cortico-world-telegram
 
-Coopanion（Cortico）的 **Telegram 个人账号** World 扩展：用你自己的真实账号收发消息，
-和手机版、电脑版 Telegram **同时在线**。不经过 Gateway、不起第二个进程、不用 Bot API。
+Coopanion（Cortico）的 Telegram 个人账号扩展。用你自己的账号收发消息，和手机、电脑上的 Telegram 同时在线。
+直连 MTProto，没有 Gateway，没有第二个进程，也不是 Bot API。
 
 ```
 Telegram 云端
@@ -15,7 +15,7 @@ Coopanion Core：人格 / 记忆 / 模型（原样复用，不改一行）
 
 ## 现在能做什么
 
-**47 个工具**，完整签名见 `describe.json` 或 `npm run describe`。
+一共 47 个工具，完整签名在 `describe.json` 里（也能用 `npm run describe` 重新生成）。
 
 ### 会话与人
 
@@ -84,7 +84,7 @@ Coopanion Core：人格 / 记忆 / 模型（原样复用，不改一行）
 - **断线补课**：重连后按 `lastSeenId` 补 24 小时内、≤200 条；运行中每 10 分钟兜底
 - **媒体缓存清理**：超过保留时长的下载文件自动删
 
-**做不到的事不会假装成功**：工具返回 `[failed] …`，端口层抛 `UnsupportedError`。
+做不成的事会直接报错，不会假装成功：工具返回 `[failed] …`，端口层抛 `UnsupportedError`。
 
 ---
 
