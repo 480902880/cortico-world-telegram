@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-telegram",
-  "version": "0.43.7",
+  "version": "0.43.8",
   "type": "module",
   "description": "Coopanion（Cortico）World：用真实的 Telegram 个人账号收发消息、媒体与表情，和桌面版/手机同时在线。A real Telegram personal account over MTProto, side by side with Desktop and mobile.",
   "license": "MIT",
@@ -23,7 +23,6 @@
     "node": ">=20"
   },
   "files": [
-    "assets",
     "src",
     "dist",
     "types",
@@ -55,8 +54,7 @@
     "api": 6,
     "icon": "./src/icon.svg",
     "webUiClient": "./dist/webui.js",
-    "describe": "./describe.json",
-    "screenshots": ["assets/screenshot-login.png"]
+    "describe": "./describe.json"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

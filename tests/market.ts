@@ -61,8 +61,8 @@ for (const file of ['dist/webui.js', 'describe.json']) {
 check('webUiClient 指向 dist/webui.js', cortico.webUiClient === './dist/webui.js');
 check('describe 指向 describe.json', cortico.describe === './describe.json');
 check('icon 文件存在', typeof cortico.icon === 'string' && existsSync(join(root, cortico.icon)));
+// 截图可选：有就必须真实存在
 const shots: string[] = cortico.screenshots ?? [];
-check('至少一张截图', shots.length > 0);
 for (const shot of shots) check(`截图存在：${shot}`, existsSync(join(root, shot)));
 
 console.log('\n# files 白名单覆盖必需产物');

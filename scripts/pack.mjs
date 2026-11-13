@@ -38,7 +38,6 @@ if (process.argv.includes('--check')) {
 
 /** 进包的顶层条目。 */
 const INCLUDE = [
-  'assets',
   'src',
   'dist',
   'types',
