@@ -197,52 +197,6 @@ npm run describe      # 生成 describe.json
 
 ---
 
-## 开发
-
-```bash
-npm run typecheck     # tsc
-npm test              # 单元 + 契约 + 市场自检 + 生命周期（全离线，不需要账号）
-npm run build:webui   # 面板产物 dist/webui.js
-npm run describe      # 重新生成 describe.json（改工具/变量后必须）
-npm run pack:release  # 打市场上架包（输出到仓库外，默认 D:\Ai）
-npm run probe         # MTProto 库兼容性探针
-```
-
-| 测试 | 覆盖 |
-|---|---|
-| `tests/contract.ts` | 工具/面板/事件/模板变量一致性 |
-| `tests/market.ts` | 上架条件：产物、keywords、tags、截图、files 白名单 |
-| `tests/lifecycle.ts` | 启动/停止/面板初始化 |
-| `tests/unit/*.test.ts` | 24 组：登录、凭证、自身消息、实体、媒体、语音、资源、限流、合并、标签、脱敏… |
-
-**改完必做的顺序**（顺序错了会出死包：面板打不开）：
-`build:webui` → `describe` → `pack:release`
-
----
-
-## 结构
-
-```
-src/
-├─ index.ts / definition.ts   World 入口与自描述
-├─ config.ts / settings.ts    worlds.telegram 配置段 / 行为页字段表
-├─ world.ts                   生命周期、授权门、事件注入、合并、面板接线
-├─ tools.ts                   47 个工具的声明与 handler
-├─ deps.ts                    依赖自检与一键安装
-├─ inbound/                   catchup（断线补课）、merge（合并窗口）
-├─ media/                     image（魔术字节嗅探）、voice（ffmpeg）、source、cache
-├─ stickers/tags.ts           本地表情语义标签
-├─ mtproto/
-│  ├─ lib.ts                  全项目唯一 import teleproto 的地方
-│  ├─ port.ts                 业务层唯一依赖的领域接口
-│  ├─ client.ts               port 实现（连接/更新桥/收发/媒体/贴纸/联系人）
-│  ├─ auth.ts / credentials.ts / session-store.ts / sent-tracker.ts / ratelimit.ts
-├─ webui/server.ts            面板数据面（invoke 分发）
-├─ webui/client.ts            面板 UI（构建成 dist/webui.js）
-└─ prompt/ENV_PROMPT.md       环境提示词模板（9 个变量）
-```
-
----
 ## 安全默认值
 
 完整说明见 [SECURITY.md](SECURITY.md)，这里只列"开箱即是什么"：
@@ -262,10 +216,8 @@ src/
 | 致命错误 | **立即停机** | 会话失效 / 账号被封 / 双开 → 不重连，等你自己处理 |
 | `PEER_FLOOD` | **24 小时只放行白名单** | 被判骚扰后不再碰陌生人 |
 
-## 隐私
+---
 
-- 所有数据只在 `data/telegram/` 本机目录；不上传第三方
-- 日志与面板里的 session、api_hash、手机号一律掩码（`tests/unit/redact.test.ts` 断言）
-- 未加白名单的会话：不建事件、不下载媒体、不唤醒模型
-- 扩展市场标签声明了 `sensitive-data`：它确实会读取账号里的聊天内容并交给模型
-- **语音不转写**：模型只能看到时长，听不到内容（ASR 不在本扩展内）
+## Star 趋势
+
+[![Star History Chart](https://api.star-history.com/svg?repos=480902880/cortico-world-telegram&type=Date)](https://star-history.com/#480902880/cortico-world-telegram&Date)
