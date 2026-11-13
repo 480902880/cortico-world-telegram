@@ -1,16 +1,16 @@
 {
   "name": "cortico-world-telegram",
-  "version": "0.43.3",
+  "version": "0.43.4",
   "type": "module",
   "description": "Coopanion（Cortico）World：用真实的 Telegram 个人账号收发消息、媒体与表情，和桌面版/手机同时在线。A real Telegram personal account over MTProto, side by side with Desktop and mobile.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/f480902880/cortico-world-telegram.git"
+    "url": "git+https://github.com/480902880/cortico-world-telegram.git"
   },
-  "homepage": "https://github.com/f480902880/cortico-world-telegram#readme",
+  "homepage": "https://github.com/480902880/cortico-world-telegram#readme",
   "bugs": {
-    "url": "https://github.com/f480902880/cortico-world-telegram/issues"
+    "url": "https://github.com/480902880/cortico-world-telegram/issues"
   },
   "keywords": [
     "cortico-world",
