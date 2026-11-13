@@ -45,10 +45,6 @@
         "displayName": "Telegram",
         "description": "用真实 Telegram 个人账号收发消息、媒体与贴纸，并与 Desktop/手机同时在线"
       },
-      "ja": {
-        "displayName": "Telegram",
-        "description": "Coopanion から、あなた自身の Telegram 個人アカウントでメッセージ・メディア・スタンプをやり取り。許可リスト制・既定はサイレント。デスクトップ版やスマホと同時に使えます。"
-      },
       "en": {
         "displayName": "Telegram",
         "description": "A real Telegram personal account over MTProto, side by side with Desktop and mobile"
