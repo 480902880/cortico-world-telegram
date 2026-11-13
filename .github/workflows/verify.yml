@@ -1,0 +1,45 @@
+name: verify
+
+# 每次推送到 main / 发 PR 时，把「能跑起来」这件事自动验证一遍。
+# 本地等价命令：npm run verify
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 是主要使用环境（面板、路径、ACL 都在那边），Linux 兜住跨平台退化
+        os: [windows-latest, ubuntu-latest]
+        node: [20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 类型检查 + 全部单测 + 自描述 + 面板构建 + 产物校验
+        run: npm run verify
+        # verify 里已经包含：typecheck → test → describe → build:webui → pack:check
+        # pack:check 会拦住「改了面板源码却没重建」的死包
+
+      - name: 保留失败时的面板产物
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-node${{ matrix.node }}
+          path: |
+            dist/
+            describe.json
+          if-no-files-found: ignore

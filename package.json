@@ -1,0 +1,76 @@
+{
+  "name": "cortico-world-telegram",
+  "version": "0.43.1",
+  "type": "module",
+  "description": "Coopanion（Cortico）World：用真实的 Telegram 个人账号收发消息、媒体与表情，和桌面版/手机同时在线。A real Telegram personal account over MTProto, side by side with Desktop and mobile.",
+  "license": "MIT",
+  "keywords": [
+    "cortico-world",
+    "cortico-extension",
+    "telegram",
+    "mtproto"
+  ],
+  "author": "f480902880",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "assets",
+    "src",
+    "dist",
+    "types",
+    "describe.json",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "cortico": {
+    "displayName": "Telegram",
+    "locales": {
+      "zh": {
+        "displayName": "Telegram",
+        "description": "用真实 Telegram 个人账号收发消息、媒体与贴纸，并与 Desktop/手机同时在线"
+      },
+      "en": {
+        "displayName": "Telegram",
+        "description": "A real Telegram personal account over MTProto, side by side with Desktop and mobile"
+      }
+    },
+    "tags": ["im", "sensitive-data"],
+    "kind": "world",
+    "api": 6,
+    "icon": "./src/icon.svg",
+    "webUiClient": "./dist/webui.js",
+    "describe": "./describe.json",
+    "screenshots": ["assets/screenshot-login.png"]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build:webui": "node scripts/build-webui.mjs",
+    "build": "npm run build:webui",
+    "pack:release": "node scripts/pack.mjs",
+    "pack:check": "node scripts/pack.mjs --check",
+    "verify": "npm run typecheck && npm test && npm run describe && npm run build:webui && npm run pack:check",
+    "probe": "tsx scripts/probe.mts",
+    "describe": "tsx scripts/describe.mts",
+    "test": "npm run test:unit && npm run test:contract && npm run test:lifecycle",
+    "test:unit": "tsx tests/unit/auth.test.ts && tsx tests/unit/credentials.test.ts && tsx tests/unit/own-message.test.ts && tsx tests/unit/entity.test.ts && tsx tests/unit/media.test.ts && tsx tests/unit/voice.test.ts && tsx tests/unit/source.test.ts && tsx tests/unit/resolve.test.ts && tsx tests/unit/approval.test.ts && tsx tests/unit/config.test.ts && tsx tests/unit/resources.test.ts && tsx tests/unit/ratelimit.test.ts && tsx tests/unit/sticker.test.ts && tsx tests/unit/image.test.ts && tsx tests/unit/member.test.ts && tsx tests/unit/cache.test.ts && tsx tests/unit/retry.test.ts && tsx tests/unit/settings.test.ts && tsx tests/unit/redact.test.ts && tsx tests/unit/sticker-tags.test.ts && tsx tests/unit/merge.test.ts && tsx tests/unit/deps.test.ts && tsx tests/unit/send-path.test.ts && tsx tests/unit/owner-trust.test.ts && tsx tests/unit/errors.test.ts && tsx tests/unit/policy.test.ts && tsx tests/unit/state-store.test.ts && tsx tests/unit/trigger.test.ts && tsx tests/unit/freshness.test.ts && tsx tests/unit/acl.test.ts && tsx tests/unit/resources-guard.test.ts && tsx tests/unit/deps-manager.test.ts && tsx tests/unit/reactions.test.ts && tsx tests/unit/quote.test.ts && tsx tests/unit/render.test.ts && tsx tests/unit/instance-lock.test.ts && tsx tests/unit/settings-wired.test.ts && tsx tests/unit/audit.test.ts && tsx tests/unit/config-wired.test.ts && tsx tests/unit/lib-lazy.test.ts && tsx tests/unit/deps-args.test.ts",
+    "test:contract": "tsx tests/contract.ts && tsx tests/market.ts",
+    "test:lifecycle": "tsx tests/lifecycle.ts"
+  },
+  "dependencies": {
+    "teleproto": "1.233.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
