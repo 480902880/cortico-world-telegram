@@ -1,6 +1,6 @@
 {
   "name": "cortico-world-telegram",
-  "version": "0.43.9",
+  "version": "0.43.10",
   "type": "module",
   "description": "Coopanion（Cortico）World：用真实的 Telegram 个人账号收发消息、媒体与表情，和桌面版/手机同时在线。A real Telegram personal account over MTProto, side by side with Desktop and mobile.",
   "license": "MIT",
@@ -62,7 +62,7 @@
     "build": "npm run build:webui",
     "pack:release": "node scripts/pack.mjs",
     "pack:check": "node scripts/pack.mjs --check",
-    "verify": "npm run typecheck && npm test && npm run describe && npm run build:webui && npm run pack:check",
+    "verify": "npm run describe && npm run typecheck && npm test && npm run build:webui && npm run pack:check",
     "probe": "tsx scripts/probe.mts",
     "describe": "tsx scripts/describe.mts",
     "test": "npm run test:unit && npm run test:contract && npm run test:lifecycle",
