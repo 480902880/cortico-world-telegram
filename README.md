@@ -1,7 +1,5 @@
 # cortico-world-telegram
 
-> 作者：f480902880 · 联系：480902880（QQ）
-
 Coopanion（Cortico）的 **Telegram 个人账号** World 扩展：用你自己的真实账号收发消息，
 和手机版、电脑版 Telegram **同时在线**。不经过 Gateway、不起第二个进程、不用 Bot API。
 
