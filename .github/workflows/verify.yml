@@ -1,0 +1,51 @@
+name: verify
+
+# 推送 / PR 时验证「能跑起来」。本地等价命令：npm run verify
+# 拆成独立步骤，失败时在页面上能直接看出是哪一环（类型 / 测试 / 产物 / 打包）。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    # 插件主要在 Windows 上用（路径、ACL、包管理器），先只跑 Windows；
+    # 需要跨平台时再往 matrix 里加 ubuntu-latest。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 生成自描述（describe.json）
+        run: npm run describe
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 单元 + 契约 + 市场自检 + 生命周期
+        run: npm test
+
+      - name: 构建面板
+        run: npm run build:webui
+
+      - name: 校验产物新鲜度
+        run: npm run pack:check
+
+      - name: 失败时保留现场
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-and-describe
+          path: |
+            dist/
+            describe.json
+          if-no-files-found: ignore
