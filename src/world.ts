@@ -9,8 +9,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Logger, StoragePart, ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -129,6 +129,10 @@ export class TelegramWorld implements World {
     return {
       ...base,
       ...raw,
+      guard: { ...base.guard, ...(raw.guard ?? {}) },
+      resources: { ...base.resources, ...(raw.resources ?? {}) },
+      preferences: { ...base.preferences, ...(raw.preferences ?? {}) },
+      rateLimit: { ...base.rateLimit, ...(raw.rateLimit ?? {}) },
       transport: { ...base.transport, ...(raw.transport ?? {}) },
       allowUsers: Array.isArray(raw.allowUsers) ? raw.allowUsers : [],
       allowChats: Array.isArray(raw.allowChats) ? raw.allowChats : [],
@@ -148,80 +152,92 @@ export class TelegramWorld implements World {
       );
     }
 
-    // S-09：启动时顺手加固会话文件的 ACL（Windows 上 chmod 不生效）
-    void this.hardenSecretFiles();
-
-    const cfg = this.cfg;
-    // 依赖是懒加载的：这里先探一次。缺依赖时不抛死——面板要能打开，
-    // 用户才有地方点「一键安装依赖」。
     try {
-      await ensureLib();
-    } catch {
-      this.lastError = LIB_MISSING_HINT;
-      this.log.warn('MTProto 依赖未就绪，先停在待安装状态', { reason: libLoadError() ?? '' });
-      return;
-    }
-    // 审计日志跟随配置（改完重启 World 生效）
-    this.audit.setEnabled(cfg.auditLog === true);
-    const resolved = resolveCredentials({ apiId: cfg.apiId, apiHash: cfg.apiHash });
-    if (!resolved.ok) {
+      // S-09：启动时顺手加固会话文件的 ACL（Windows 上 chmod 不生效）
+      void this.hardenSecretFiles();
+
+      const cfg = this.cfg;
+      // 依赖是懒加载的：这里先探一次。缺依赖时不抛死——面板要能打开，
+      // 用户才有地方点「一键安装依赖」。
+      try {
+        await ensureLib();
+      } catch {
+        this.lastError = LIB_MISSING_HINT;
+        this.log.warn('MTProto 依赖未就绪，先停在待安装状态', { reason: libLoadError() ?? '' });
+        return;
+      }
+      this.audit.setEnabled(cfg.auditLog === true);
+      const resolved = resolveCredentials({ apiId: cfg.apiId, apiHash: cfg.apiHash });
+      if (!resolved.ok) {
+        throw new Error(`${resolved.error}${resolved.detail ? `：${resolved.detail}` : ''}`);
+      }
+      this.credentials = resolved.value;
+
+      this.client = new MtprotoClient({
+        credentials: this.credentials,
+        session: this.sessionStore.read(),
+        transport: cfg.transport,
+        ...(cfg.ffmpegPath ? { ffmpegPath: cfg.ffmpegPath } : {}),
+        mediaDir: this.sessionStore.paths.media,
+        rateLimit: cfg.rateLimit,
+        log: this.log,
+        onReconnect: () => { void this.runCatchUp('reconnect'); },
+        onRevoked: (detail) => {
+          this.lastError = detail;
+          this.auth?.markRevoked(detail);
+          this.log.warn('会话被其他设备终止，已停止重连并清除本地 session', { detail });
+        },
+      });
+      this.auth = new AuthMachine(this.client, this.sessionStore, this.log);
+      this.client.onUpdates({
+        onMessage: (msg) => { void this.handleMessage(msg); },
+        onReaction: (info) => { void this.handleReaction(info); },
+        onEditMessage: (msg) => { void this.handleEdit(msg); },
+        onDelete: (chat, ids) => { void this.handleDelete(chat, ids); },
+      });
+
+      if (this.sessionStore.present()) {
+        const status = await this.auth.restore();
+        if (status.step === 'revoked') this.lastError = status.detail;
+        if (status.step === 'error') this.lastError = status.detail;
+        this.pruneMedia(true);
+        // 启动时补一次：把停机期间漏掉的消息捞回来（消息级，不是完整更新恢复）
+        if (status.step === 'authorized') void this.runCatchUp('start');
+      }
+
+      this.log.info('Telegram World 已启动', {
+        lib: libInfo().id,
+        credential: credentialFingerprint(this.credentials),
+        session: this.sessionStore.describe().masked,
+        account: this.auth.status().account?.id ?? null,
+      });
+
+      // 在线状态：默认保持沉默（不调 updateStatus），开了才主动上报，并定时续命
+      this.applyPresence();
+
+      // 运行中也补课：库的 difference 恢复偶尔漏消息（尤其手机在发、桌面在收时）
+      this.applyCatchUpTimer();
+    } catch (error) {
+      // 启动阶段任意环节抛错都要释放双开锁，避免残留锁阻塞后续重启
       this.lock.release();
-      throw new Error(`${resolved.error}${resolved.detail ? `：${resolved.detail}` : ''}`);
-    }
-    this.credentials = resolved.value;
-
-    this.client = new MtprotoClient({
-      credentials: this.credentials,
-      session: this.sessionStore.read(),
-      transport: cfg.transport,
-      ...(cfg.ffmpegPath ? { ffmpegPath: cfg.ffmpegPath } : {}),
-      mediaDir: this.sessionStore.paths.media,
-      rateLimit: cfg.rateLimit,
-      log: this.log,
-      onReconnect: () => { void this.runCatchUp('reconnect'); },
-      onRevoked: (detail) => {
-        this.lastError = detail;
-        this.log.warn('会话被其他设备终止，已停止重连', { detail });
-      },
-    });
-    this.auth = new AuthMachine(this.client, this.sessionStore, this.log);
-    this.client.onUpdates({
-      onMessage: (msg) => { void this.handleMessage(msg); },
-      onReaction: (info) => { void this.handleReaction(info); },
-      onEditMessage: (msg) => { void this.handleEdit(msg); },
-      onDelete: (chat, ids) => { void this.handleDelete(chat, ids); },
-    });
-
-    if (this.sessionStore.present()) {
-      const status = await this.auth.restore();
-      if (status.step === 'revoked') this.lastError = status.detail;
-      if (status.step === 'error') this.lastError = status.detail;
-      this.pruneMedia(true);
-      // 启动时补一次：把停机期间漏掉的消息捞回来（消息级，不是完整更新恢复）
-      if (status.step === 'authorized') void this.runCatchUp('start');
-    }
-
-    this.log.info('Telegram World 已启动', {
-      lib: libInfo().id,
-      credential: credentialFingerprint(this.credentials),
-      session: this.sessionStore.describe().masked,
-      account: this.auth.status().account?.id ?? null,
-    });
-
-    // 在线状态：默认保持沉默（不调 updateStatus），开了才主动上报，并定时续命
-    this.applyPresence();
-
-    // 运行中也补课：库的 difference 恢复偶尔漏消息（尤其手机在发、桌面在收时）
-    if (this.cfg.catchUp) {
-      this.gapTimer = setInterval(() => {
-        void this.runCatchUp('gap');
-      }, GAP_CHECK_INTERVAL_MS);
-      this.gapTimer.unref?.();
+      throw error;
     }
   }
 
   /** 运行中会话级补课的定时器（每 10 分钟一次，覆盖"在线但更新丢了"）。 */
   private gapTimer: ReturnType<typeof setInterval> | undefined;
+
+  private applyCatchUpTimer(): void {
+    if (this.gapTimer) {
+      clearInterval(this.gapTimer);
+      this.gapTimer = undefined;
+    }
+    if (!this.cfg.catchUp) return;
+    this.gapTimer = setInterval(() => {
+      void this.runCatchUp('gap');
+    }, GAP_CHECK_INTERVAL_MS);
+    this.gapTimer.unref?.();
+  }
 
   /** 在线状态定时器（只有 onlineWhileRunning 才会启动）。 */
   private presenceTimer?: ReturnType<typeof setInterval>;
@@ -260,15 +276,18 @@ export class TelegramWorld implements World {
     if (this.presenceTimer) {
       clearInterval(this.presenceTimer);
       this.presenceTimer = undefined;
-      // 只把这条连接标记为离线；你手机/桌面该怎样还怎样
-      void this.client?.setOnline(false).catch(() => undefined);
+      // 只把这条连接标记为离线；你手机/桌面该怎样还怎样（设 1.5s 超时避免卡住停机）
+      await Promise.race([
+        this.client?.setOnline(false).catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
     }
     if (this.gapTimer) {
       clearInterval(this.gapTimer);
       this.gapTimer = undefined;
     }
-    // 停机前把缓冲的批次推出去，别把攒着的消息丢了
-    this.flushAllMerged();
+    // 停机前把缓冲的批次推出去并等待完成，别把攒着的消息丢了
+    await this.flushAllMerged();
     // 状态游标是攒批写盘的：停机前必须落盘，否则最近 1 秒的进度会丢
     try {
       await this.stateStore.close();
@@ -361,8 +380,10 @@ export class TelegramWorld implements World {
   private isDuplicate(msg: Msg): boolean {
     const key = `${msg.chatId}:${msg.id}`;
     const now = Date.now();
+    // Map 按插入顺序保存时间戳，遇到第一条未过期即可停止扫描（均摊 O(1)）
     for (const [k, at] of this.seen) {
-      if (now - at > DEDUPE_TTL_MS) this.seen.delete(k);
+      if (now - at <= DEDUPE_TTL_MS) break;
+      this.seen.delete(k);
     }
     if (this.seen.has(key)) return true;
     this.seen.set(key, now);
@@ -371,6 +392,14 @@ export class TelegramWorld implements World {
       if (oldest !== undefined) this.seen.delete(oldest);
     }
     return false;
+  }
+
+  /** 仅对白名单/审批人会话推进 lastSeenId，防止 10 分钟补课重放旧审批回复或自发消息。 */
+  private bumpCursorIfWatched(msg: Msg): void {
+    if (msg.id <= 0) return;
+    if (this.isAllowlisted({ id: msg.chatId, kind: msg.chatKind }) || this.isApproverMessage(msg)) {
+      this.stateStore.bump(msg.chatId, msg.id, Date.now());
+    }
   }
 
   private async handleMessage(msg: Msg, opts: { catchUp?: boolean } = {}): Promise<void> {
@@ -382,13 +411,16 @@ export class TelegramWorld implements World {
     if (!msg.out) {
       const command = parseApprovalCommand(msg.text);
       if (command && this.isApproverMessage(msg)) {
+        this.bumpCursorIfWatched(msg);
         await this.handleApprovalCommand(command, msg);
         return;
       }
       // 白话回复也算：主人在私聊里回「可以 / 不行 / 随便你」就处理最近一条待批准
-      if (this.isApproverMessage(msg) && this.approvals.size() > 0) {
+      // 补课捞出的历史消息绝不用于触发当前待审批（避免旧回复误批新请求）
+      if (!opts.catchUp && this.isApproverMessage(msg) && this.approvals.size() > 0) {
         const reply = classifyOwnerReply(msg.text);
         if (reply) {
+          this.bumpCursorIfWatched(msg);
           await this.handleOwnerReply(reply, msg);
           return;
         }
@@ -400,6 +432,7 @@ export class TelegramWorld implements World {
     // 自己账号发出的：本插件发的 / Desktop、手机发的，都走这里
     if (msg.viaClient || msg.out) {
       this.rememberOwnId(msg.chatId, msg.id);
+      this.bumpCursorIfWatched(msg);
       if (cfg.watchSelf === 'off') return;
       if (cfg.watchSelf === 'record') {
         await this.push(mkEvent('telegram.self', msg, this.render(msg), this.renderMeta(msg, opts)), { deliver: false });
@@ -412,6 +445,8 @@ export class TelegramWorld implements World {
 
     const gate = this.gate(msg);
     if (!gate.ok) {
+      // 白名单群未命中触发条件的消息也要推进游标，避免 10 分钟后补课反复捞取
+      this.bumpCursorIfWatched(msg);
       this.log.debug('消息未通过授权', { chatId: msg.chatId, reason: gate.reason });
       return;
     }
@@ -434,6 +469,7 @@ export class TelegramWorld implements World {
     items: Array<{ text: string; meta: Record<string, unknown>; blobs: Array<{ bytes: Uint8Array; mime: string; name: string; fallbackText: string }> }>;
     firstAt: number;
     lastAt: number;
+    trigger: 'flush' | 'debounce';
     timer?: ReturnType<typeof setTimeout>;
   }>();
 
@@ -472,6 +508,7 @@ export class TelegramWorld implements World {
     if (existing) {
       existing.items.push({ text, meta, blobs });
       existing.lastAt = now;
+      if (trigger === 'flush') existing.trigger = 'flush';
       if (existing.timer) clearTimeout(existing.timer);
       existing.timer = undefined;
       if (shouldFlush(existing.items.length, existing.firstAt, now, policy)) {
@@ -482,19 +519,23 @@ export class TelegramWorld implements World {
       return;
     }
 
-    this.mergePending.set(key, { items: [{ text, meta, blobs }], firstAt: now, lastAt: now });
+    this.mergePending.set(key, { items: [{ text, meta, blobs }], firstAt: now, lastAt: now, trigger });
     this.armTimer(key, policy);
   }
 
   private armTimer(chatId: number, policy: MergePolicy): void {
     const entry = this.mergePending.get(chatId);
     if (!entry) return;
-    const linger = Math.max(0, policy.windowMs - (Date.now() - entry.lastAt));
-    entry.timer = setTimeout(() => { void this.flushMerged(chatId); }, linger);
+    const now = Date.now();
+    const linger = Math.max(0, policy.windowMs - (now - entry.lastAt));
+    // 受 maxAgeMs 约束：绝不让单批等待时间突破上限
+    const maxRemain = policy.maxAgeMs > 0 ? Math.max(0, policy.maxAgeMs - (now - entry.firstAt)) : linger;
+    const delay = Math.min(linger, maxRemain);
+    entry.timer = setTimeout(() => { void this.flushMerged(chatId); }, delay);
     entry.timer.unref?.();
   }
 
-  /** 已知的机器人会话（探测一次后缓存，避免每次调用都打 RPC）。 */
+  /** 已知的机器人会话（探测一次后缓存，避免每次调用都打 RPC；有容量上限）。 */
   private readonly botChatCache = new Map<number, boolean>();
 
   /** 判断某个私聊是不是 TG 机器人账号。 */
@@ -507,6 +548,10 @@ export class TelegramWorld implements World {
       const entity = await this.client!.userInfo(chat);
       const isBot = (entity as { bot?: boolean }).bot === true;
       this.botChatCache.set(chat.id, isBot);
+      if (this.botChatCache.size > 1000) {
+        const oldest = this.botChatCache.keys().next().value;
+        if (oldest !== undefined) this.botChatCache.delete(oldest);
+      }
       return isBot;
     } catch {
       // 查不到就当真人处理（放宽，不是拒绝）
@@ -556,20 +601,17 @@ export class TelegramWorld implements World {
   private isSongDirPath(path: string): boolean {
     const dir = this.resourceDirs().song;
     if (!dir) return false;
-    const norm = (value: string): string => {
-      const unified = value.replace(/\\/g, '/').replace(/\/+$/, '');
+    const canon = (value: string): string => {
+      let target = resolve(value);
+      try {
+        target = realpathSync.native(target);
+      } catch {
+        // 路径不存在时退回 resolve
+      }
+      const unified = target.replace(/\\/g, '/').replace(/\/+$/, '');
       return process.platform === 'win32' ? unified.toLowerCase() : unified;
     };
-    return norm(path).startsWith(`${norm(dir)}/`);
-  }
-
-  /** 入参可能是相对路径或 blob 句柄：解析后再判断是不是唱歌产物。 */
-  private isSongFile(raw: string): boolean {
-    try {
-      return this.isSongDirPath(this.materializeSource(raw).path);
-    } catch {
-      return false;
-    }
+    return canon(path).startsWith(`${canon(dir)}/`);
   }
 
   /** 发消息前的统一闸门：被 PEER_FLOOD 罚站时只放行白名单会话。 */
@@ -614,14 +656,12 @@ export class TelegramWorld implements World {
     if (entry.items.length > 1) {
       this.log.debug('合并投递', { chatId, merged: entry.items.length, chars: text.length });
     }
-    await this.push(mkEvent('telegram.message', lastMsg, text, meta), { trigger: 'flush' }, blobs);
+    await this.push(mkEvent('telegram.message', lastMsg, text, meta), { trigger: entry.trigger }, blobs);
   }
 
   /** 停机/重启前把缓冲的批次推出去，别丢消息。 */
-  private flushAllMerged(): void {
-    for (const chatId of [...this.mergePending.keys()]) {
-      void this.flushMerged(chatId);
-    }
+  private async flushAllMerged(): Promise<void> {
+    await Promise.all([...this.mergePending.keys()].map((chatId) => this.flushMerged(chatId)));
   }
 
   /** 媒体缓存清理：启动时清一次，之后每小时最多一次（清理是维护动作，不该拖慢消息）。 */
@@ -668,7 +708,7 @@ export class TelegramWorld implements World {
         removed: result.removed,
         freedBytes: result.bytes,
         kept: result.kept,
-        remainingBytes: cacheStats(dir).bytes,
+        remainingBytes: result.remainingBytes,
         hours: 0,
         all: true,
       };
@@ -682,7 +722,7 @@ export class TelegramWorld implements World {
       removed: result.removed,
       freedBytes: result.bytes,
       kept: result.kept,
-      remainingBytes: cacheStats(dir).bytes,
+      remainingBytes: result.remainingBytes,
       hours,
       all: false,
     };
@@ -696,14 +736,14 @@ export class TelegramWorld implements World {
     return scanRecent(dir, limit).filter((file) => isLocalStickerUsable(file.path));
   }
 
-  /** 面板用：数量 + 形态分布 + 打标签进度（不列文件名，42 条太吵）。 */
-  private stickerTagSummary(): {
+  /** 面板用：数量 + 形态分布 + 打标签进度（可传入已扫好的文件列表，避免重复扫盘）。 */
+  private stickerTagSummary(preScanned?: ResourceFile[]): {
     total: number;
     tagged: number;
     pending: number;
     byForm: { sticker: number; gif: number; photo: number };
   } {
-    const files = this.localStickerFiles();
+    const files = preScanned ?? this.localStickerFiles();
     const summary = this.stickerTags.summary(files);
     const byForm = { sticker: 0, gif: 0, photo: 0 };
     for (const file of files) {
@@ -722,12 +762,24 @@ export class TelegramWorld implements World {
     const files = this.localStickerFiles();
     const pending = this.stickerTags.pending(files);
     const viewable = pending.filter((file) => VIEWABLE_STICKER.test(file.path));
-    const skipped = pending.length - viewable.length; // tgs/webm 模型看不了
+    let skipped = pending.length - viewable.length; // tgs/webm 模型看不了
+    const want = Math.max(1, Math.min(10, count));
     const items: Array<{ name: string; path: string; size: number; form: string; mime: string; bytes: Uint8Array }> = [];
-    for (const file of viewable.slice(0, Math.max(1, Math.min(10, count)))) {
+    let inspected = 0;
+    for (const file of viewable) {
+      if (items.length >= want) break;
+      inspected += 1;
+      // 超过 4 MB 的文件跳过并顺延看后面的，不卡死队列
+      if (file.size > 4 * 1024 * 1024) {
+        skipped += 1;
+        continue;
+      }
       try {
         const bytes = new Uint8Array(readFileSync(file.path));
-        if (bytes.length > 4 * 1024 * 1024) continue;
+        if (bytes.length > 4 * 1024 * 1024) {
+          skipped += 1;
+          continue;
+        }
         items.push({
           name: file.name,
           path: file.path,
@@ -737,27 +789,37 @@ export class TelegramWorld implements World {
           bytes,
         });
       } catch {
-        // 读不到就跳过
+        skipped += 1;
       }
     }
-    return { items, remaining: Math.max(0, viewable.length - items.length), skipped };
+    return { items, remaining: Math.max(0, viewable.length - inspected), skipped };
   }
 
   /**
    * 把图片直接挂到事件上——模型一进上下文就能"看见"，不用先调 download_media。
    *
-   * 照片取原图（≤ maxMediaBytes）；视频/文件取**缩略图**（不下整段视频）。
+   * 照片取原图（≤ maxMediaBytes）；动态 GIF / 视频贴纸 / 视频 / 文档只取**缩略图**（不下整段）。
    * 自己发的不取（那些事件是 deliver:false，浪费流量）。任何一步失败都返回空数组。
    */
   private async mediaBlobs(msg: Msg): Promise<Array<{ bytes: Uint8Array; mime: string; name: string; fallbackText: string }>> {
     if (!this.cfg.autoImages || !this.client || !this.host) return [];
-    this.pruneMedia();
     const kind = msg.media?.kind;
     if (!kind) return [];
     const chat = { id: msg.chatId, kind: msg.chatKind };
+    const mime = (msg.media?.mime ?? '').toLowerCase();
+    const size = msg.media?.size ?? 0;
+
+    // 动图（video/mp4）与动态贴纸（tgs/webm）不是静态图：不要整段下载，直接按缩略图处理
+    const isAnimated = (kind === 'gif' || kind === 'sticker')
+      && (mime.startsWith('video/') || mime.includes('tgsticker'));
 
     try {
-      if (kind === 'photo' || kind === 'gif' || kind === 'sticker') {
+      if ((kind === 'photo' || kind === 'gif' || kind === 'sticker') && !isAnimated) {
+        // 已知体积超上限时跳过下载，省流量和磁盘 IO
+        if (size > 0 && size > this.cfg.maxMediaBytes) {
+          this.log.debug('入站图片体积超过上限，跳过下载', { messageId: msg.id, size, maxBytes: this.cfg.maxMediaBytes });
+          return [];
+        }
         const image = await this.client.fetchImage(chat, msg.id, this.cfg.maxMediaBytes);
         if (!image) return [];
         if (!this.host.modelFacts.accepts(image.mime)) {
@@ -767,9 +829,9 @@ export class TelegramWorld implements World {
         return [{ bytes: image.bytes, mime: image.mime, name: image.name, fallbackText: 'Telegram 图片' }];
       }
 
-      // 视频 / 文档：只取缩略图，让模型看一眼预览帧
+      // 视频 / 文档 / 动态 GIF / 动态贴纸：只取缩略图，让模型看一眼预览帧
       if (!this.cfg.autoThumbnails) return [];
-      if (kind !== 'video' && kind !== 'document') return [];
+      if (kind !== 'video' && kind !== 'document' && !isAnimated) return [];
       const thumb = await this.client.fetchThumbnail(chat, msg.id);
       if (!thumb) return [];
       if (!this.host.modelFacts.accepts(thumb.mime)) return [];
@@ -777,6 +839,9 @@ export class TelegramWorld implements World {
     } catch (error) {
       this.log.debug('附件没法附带（下载失败或已过期）', { messageId: msg.id, reason: errText(error) });
       return [];
+    } finally {
+      // 媒体清理放 finally 异步节流执行，不阻塞图片拉取本身
+      this.pruneMedia();
     }
   }
 
@@ -817,12 +882,16 @@ export class TelegramWorld implements World {
     if (!Number.isFinite(messageId) || messageId <= 0) return;
     const set = this.ownMessageIds.get(chatId) ?? new Set<number>();
     set.add(messageId);
-    // 只留最近的 200 条，别无限长
+    // 只留最近的 200 条，外层上限 500 个会话，别无限长
     if (set.size > 200) {
       const first = set.values().next().value;
       if (first !== undefined) set.delete(first);
     }
     this.ownMessageIds.set(chatId, set);
+    if (this.ownMessageIds.size > 500) {
+      const oldestChat = this.ownMessageIds.keys().next().value;
+      if (oldestChat !== undefined) this.ownMessageIds.delete(oldestChat);
+    }
   }
 
   private isOwnMessageId(chatId: number, messageId: number): boolean {
@@ -869,6 +938,12 @@ export class TelegramWorld implements World {
 
   /** 别人编辑了消息：模型得知道内容变了，否则会一直引用旧说法。 */
   private async handleEdit(msg: Msg): Promise<void> {
+    // 自己（含 bot 调用 telegram_edit_message）编辑的消息不唤醒模型
+    if (msg.out || msg.viaClient) return;
+    const cfg = this.cfg;
+    if (msg.chatKind === 'user' && !cfg.watchPrivate) return;
+    if (msg.chatKind === 'group' && !cfg.watchGroup) return;
+    if (msg.chatKind === 'channel' && !cfg.watchChannel) return;
     if (!this.isAllowlisted({ id: msg.chatId, kind: msg.chatKind })) return;
     const quote = await this.quoteOf(msg);
     const text = `[编辑] ${this.render(msg, quote)}`;
@@ -880,7 +955,7 @@ export class TelegramWorld implements World {
         senderKey: `chat:${msg.chatId}`,
         ts: new Date().toISOString(),
       },
-      { trigger: 'flush' },
+      { trigger: msg.chatKind === 'user' ? 'flush' : 'debounce' },
     );
   }
 
@@ -933,6 +1008,15 @@ export class TelegramWorld implements World {
    * 取被引用那条消息的正文（截断）。
    * 拿不到就返回 undefined——宁可只显示编号，也不要编内容。
    */
+  private cacheQuote(key: string, value: string): void {
+    this.quoteCache.set(key, value);
+    while (this.quoteCache.size > 300) {
+      const oldest = this.quoteCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.quoteCache.delete(oldest);
+    }
+  }
+
   private async quoteOf(msg: Msg): Promise<string | undefined> {
     if (!msg.replyToId) return undefined;
     const key = msg.chatId + ':' + msg.replyToId;
@@ -941,19 +1025,18 @@ export class TelegramWorld implements World {
     try {
       const quoted = await this.client?.getMessage({ id: msg.chatId, kind: msg.chatKind }, msg.replyToId);
       if (!quoted) {
-        this.quoteCache.set(key, '');
+        this.cacheQuote(key, '');
         return undefined;
       }
       const who = quoted.senderName ? quoted.senderName + ': ' : '';
       const kindNote = quoted.media ? '[' + quoted.media.kind + ']' : '';
       const body = (quoted.text || kindNote).replace(/\s+/g, ' ').trim();
       const value = who + truncate(body, 120);
-      if (this.quoteCache.size > 300) this.quoteCache.clear();
-      this.quoteCache.set(key, value);
+      this.cacheQuote(key, value);
       return value || undefined;
     } catch (error) {
+      // 瞬时网络/RPC 错误不永久写死空缓存，下次还能重试
       this.log.debug('取引用正文失败', { chatId: msg.chatId, messageId: msg.replyToId, reason: errText(error) });
-      this.quoteCache.set(key, '');
       return undefined;
     }
   }
@@ -1006,11 +1089,13 @@ export class TelegramWorld implements World {
     try {
       const cfg = this.cfg;
       const targets: ChatRef[] = [
-        ...[...enabledIds(cfg.allowUsers)].map((id) => ({ id, kind: 'user' as const })),
-        ...[...enabledIds(cfg.allowChats)].map((id) => ({
-          id,
-          kind: (id <= -1_000_000_000_000 ? 'channel' : 'group') as ChatRef['kind'],
-        })),
+        ...(cfg.watchPrivate ? [...enabledIds(cfg.allowUsers)].map((id) => ({ id, kind: 'user' as const })) : []),
+        ...(cfg.watchGroup || cfg.watchChannel
+          ? [...enabledIds(cfg.allowChats)].map((id) => ({
+              id,
+              kind: (id <= -1_000_000_000_000 ? 'channel' : 'group') as ChatRef['kind'],
+            }))
+          : []),
       ].slice(0, 20);
       if (!targets.length) return;
 
@@ -1020,13 +1105,19 @@ export class TelegramWorld implements World {
         const cursor = this.stateStore.cursor(chat.id);
         let messages: Msg[] = [];
         try {
-          messages = await this.client.history(chat, { limit: 50 });
+          messages = await this.client.history(chat, { limit: cursor ? 50 : 1 });
         } catch (error) {
           this.log.debug('补课：读历史失败', { chatId: chat.id, reason: errText(error) });
           continue;
         }
+        // 新加入白名单、此前无游标的会话：用当前最新消息初始化游标，不把过去 24 小时的旧记录一股脑灌给模型
+        if (!cursor) {
+          const maxId = messages.reduce((max, item) => Math.max(max, item.id), 0);
+          if (maxId > 0) this.stateStore.bump(chat.id, maxId, Date.now());
+          continue;
+        }
         const fresh = selectFreshMessages(messages, {
-          ...(cursor ? { lastSeenId: cursor.lastSeenId } : {}),
+          lastSeenId: cursor.lastSeenId,
           limit: Math.min(budget, 50),
         });
         for (const msg of fresh) {
@@ -1200,8 +1291,8 @@ export class TelegramWorld implements World {
       'telegram.media': media,
       'telegram.stickers': (() => {
         const dirs = this.resourceDirs();
-        const tags = this.stickerTagSummary();
         const files = this.localStickerFiles();
+        const tags = this.stickerTagSummary(files);
         const tagged = files
           .map((file) => ({ file, tag: this.stickerTags.get(file.name) }))
           .filter((row) => row.tag && row.tag.size === row.file.size)
@@ -1333,33 +1424,46 @@ export class TelegramWorld implements World {
         this.assertReady();
         return this.client!.commonChats(user, limit);
       },
-      addContact: async (user, opts) => this.guardOp(
-        'contact_write',
-        this.cfg.guard.contactWrite,
-        `把 ${this.chatLabel(user)} 存入联系人`,
-        String(user.id),
-        async () => {
-          await this.client!.addContact(user, opts);
-          return `[联系人] 已添加 ${this.chatLabel(user)}`;
-        },
-      ),
-      deleteContact: async (user) => this.guardOp(
-        'contact_write',
-        this.cfg.guard.contactWrite,
-        `把 ${this.chatLabel(user)} 从联系人里删掉`,
-        String(user.id),
-        async () => {
-          await this.client!.deleteContact(user);
-          return `[联系人] 已删除 ${this.chatLabel(user)}`;
-        },
-      ),
-      blockUser: async (user) => {
+      addContact: async (user, opts) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(user, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
+        return this.guardOp(
+          'contact_write',
+          this.cfg.guard.contactWrite,
+          `把 ${this.chatLabel(user)} 存入联系人`,
+          String(user.id),
+          async () => {
+            await this.client!.addContact(user, opts);
+            return `[联系人] 已添加 ${this.chatLabel(user)}`;
+          },
+        );
+      },
+      deleteContact: async (user) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(user, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
+        return this.guardOp(
+          'contact_write',
+          this.cfg.guard.contactWrite,
+          `把 ${this.chatLabel(user)} 从联系人里删掉`,
+          String(user.id),
+          async () => {
+            await this.client!.deleteContact(user);
+            return `[联系人] 已删除 ${this.chatLabel(user)}`;
+          },
+        );
+      },
+      blockUser: async (user, reason) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(user, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
         // 拉黑是可感知、难回退的动作：即使策略是 auto，也留一条 warn 级日志
-        this.log.warn('拉黑用户', { userId: user.id, policy: this.cfg.guard.blockUser });
+        this.log.warn('拉黑用户', { userId: user.id, policy: this.cfg.guard.blockUser, ...(reason ? { reason } : {}) });
         return this.guardOp(
           'contact_write',
           this.cfg.guard.blockUser,
-          `拉黑 ${this.chatLabel(user)}（对方不能再发消息）`,
+          `拉黑 ${this.chatLabel(user)}（对方不能再发消息）${reason ? `；理由：${reason}` : ''}`,
           String(user.id),
           async () => {
             await this.client!.blockUser(user);
@@ -1368,6 +1472,7 @@ export class TelegramWorld implements World {
         );
       },
       unblockUser: async (user) => {
+        this.assertReady();
         try {
           await this.client!.unblockUser(user);
           return { status: 'done', message: `[拉黑] 已解除 ${this.chatLabel(user)}` };
@@ -1381,6 +1486,7 @@ export class TelegramWorld implements World {
       },
       muteChat: async (chat, minutes) => {
         this.assertReady();
+        await this.assertAllowed(chat, 'danger');
         return this.client!.muteChat(chat, minutes);
       },
       searchMessages: async (chat, query, limit) => {
@@ -1401,6 +1507,7 @@ export class TelegramWorld implements World {
           this.log.warn('replyMode=review 尚未实现，按直发处理', { chatId: chat.id });
         }
         const send = async (): Promise<string> => {
+          await this.showTyping(chat);
           const sent = await this.client!.sendText(chat, text, opts);
           this.rememberOwnId(chat.id, sent.messageId);
           return `[sent #${sent.messageId} → ${this.chatLabel(chat)}]`;
@@ -1419,17 +1526,23 @@ export class TelegramWorld implements World {
           return { status: 'denied', message: `[failed] 发送失败：${errText(error)}` };
         }
       },
-      deleteMessages: async (chat, ids, revoke) => this.guardOp(
-        'delete',
-        this.cfg.guard.deleteRevoke,
-        `删除 ${this.chatLabel(chat)} 的 ${ids.length} 条消息（${ids.slice(0, 5).map((id) => `#${id}`).join(' ')}）${revoke ? '，双方都删' : ''}`,
-        String(chat.id),
-        async () => {
-          const count = await this.client!.deleteMessages(chat, ids, revoke);
-          return `[deleted ${count} 条 → ${this.chatLabel(chat)}]`;
-        },
-      ),
+      deleteMessages: async (chat, ids, revoke) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(chat, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
+        return this.guardOp(
+          'delete',
+          this.cfg.guard.deleteRevoke,
+          `删除 ${this.chatLabel(chat)} 的 ${ids.length} 条消息（${ids.slice(0, 5).map((id) => `#${id}`).join(' ')}）${revoke ? '，双方都删' : ''}`,
+          String(chat.id),
+          async () => {
+            const count = await this.client!.deleteMessages(chat, ids, revoke);
+            return `[deleted ${count} 条 → ${this.chatLabel(chat)}]`;
+          },
+        );
+      },
       forwardMessages: async (from, ids, to) => {
+        this.assertReady();
         // 目标必须也在监听名单里（同 sendMessage 的理由）
         if (!this.isAllowlisted(to)) {
           return {
@@ -1437,6 +1550,8 @@ export class TelegramWorld implements World {
             message: `[denied] 目标 ${this.chatLabel(to)} 不在监听名单里，不能把消息转过去`,
           };
         }
+        const danger = await this.checkPolicy(to, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
         return this.guardOp(
           'forward',
           'auto',
@@ -1444,6 +1559,7 @@ export class TelegramWorld implements World {
           String(to.id),
           async () => {
             const sent = await this.client!.forward(from, ids, to);
+            for (const item of sent) this.rememberOwnId(to.id, item.messageId);
             return `[forwarded ${sent.length} 条 → ${this.chatLabel(to)}]`;
           },
         );
@@ -1499,6 +1615,9 @@ export class TelegramWorld implements World {
       },
       cleanupMedia: async (opts) => this.cleanupMedia(opts),
       pinMessage: async (chat, messageId, pin) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(chat, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
         try {
           await this.client!.pinMessage(chat, messageId, pin);
           return { status: 'done', message: `[置顶] ${pin ? '已置顶' : '已取消置顶'} #${messageId}（${this.chatLabel(chat)}）` };
@@ -1507,6 +1626,9 @@ export class TelegramWorld implements World {
         }
       },
       archiveChat: async (chat, archive) => {
+        this.assertReady();
+        const danger = await this.checkPolicy(chat, 'danger');
+        if (danger.verdict === 'deny') return { status: 'denied', message: `[denied] ${danger.reason ?? '这里不能做这类操作'}` };
         try {
           await this.client!.archiveChat(chat, archive);
           return { status: 'done', message: `[归档] ${this.chatLabel(chat)} ${archive ? '已移入归档' : '已移回主列表'}` };
@@ -1515,6 +1637,7 @@ export class TelegramWorld implements World {
         }
       },
       saveMessage: async (chat, messageId) => {
+        this.assertReady();
         try {
           const sent = await this.client!.saveMessage(chat, messageId);
           return {
@@ -1536,6 +1659,9 @@ export class TelegramWorld implements World {
       sendAlbum: async (chat, filePaths, caption) => {
         this.assertReady();
         this.assertCanReach(chat);
+        if (!this.isAllowlisted(chat)) {
+          return { kind: 'denied', message: `[denied] ${this.chatLabel(chat)} 不在监听名单里，不能主动发相册` };
+        }
         const resolved = filePaths.map((path) => this.materializeSource(path).path);
         // 整组都是唱歌目录里的产物 → 算表演，不走文件审批
         const allSongs = resolved.length > 0 && resolved.every((path) => this.isSongDirPath(path));
@@ -1547,6 +1673,7 @@ export class TelegramWorld implements World {
         const doSend = async (): Promise<string> => {
           const sent = await this.client!.sendAlbum(chat, resolved, caption);
           ids = sent.map((item) => item.messageId);
+          for (const id of ids) this.rememberOwnId(chat.id, id);
           return `[album sent] ${ids.length} 张 → ${this.chatLabel(chat)}`;
         };
         if (policy.verdict === 'ask') {
@@ -1567,14 +1694,18 @@ export class TelegramWorld implements World {
       sendMedia: async (chat, filePath, opts) => {
         this.assertReady();
         this.assertCanReach(chat);
-        // 唱歌目录里的产物算「表演」（song），不走文件审批；语音条算 voice
-        const action: ActionKind = opts.asVoice ? 'voice' : this.isSongFile(filePath) ? 'song' : 'file';
+        if (!this.isAllowlisted(chat)) {
+          return { kind: 'denied', message: `[denied] ${this.chatLabel(chat)} 不在监听名单里，不能主动发媒体` };
+        }
+        // 先物化一次路径（避免 log:/mem: blob 重复落盘两份临时文件），再判是否为唱歌目录
+        const source = this.materializeSource(filePath);
+        // 唱歌目录里的产物算「表演」（song），不走文件审批；语音条算 voice（群里均直接放行）
+        const action: ActionKind = opts.asVoice ? 'voice' : this.isSongDirPath(source.path) ? 'song' : 'file';
         const policy = await this.checkPolicy(chat, action);
         if (policy.verdict === 'deny') {
           return { kind: 'denied', message: `[denied] ${policy.reason ?? '这里不能发文件'}` };
         }
 
-        const source = this.materializeSource(filePath);
         const doSend = async (): Promise<string> => {
           this.log.info('发送媒体', {
             chatId: chat.id,
@@ -1583,6 +1714,7 @@ export class TelegramWorld implements World {
             asVoice: !!opts.asVoice,
           });
           const sent = await this.client!.sendFile(chat, source.path, opts);
+          this.rememberOwnId(chat.id, sent.messageId);
           const id = sent.messageId > 0 ? ` #${sent.messageId}` : '（id 未确认）';
           return `[sent${id} → ${this.chatLabel(chat)}]${source.note ? `（${source.note}）` : ''}`;
         };
@@ -1602,6 +1734,7 @@ export class TelegramWorld implements World {
         }
 
         const sent = await this.client!.sendFile(chat, source.path, opts);
+        this.rememberOwnId(chat.id, sent.messageId);
         return { kind: 'sent', sent, path: source.path, ...(source.note ? { note: source.note } : {}) };
       },
       // ── 表情包 ────────────────────────────────────────
@@ -1617,10 +1750,14 @@ export class TelegramWorld implements World {
       sendSticker: async (chat, shortName, opts) => {
         this.assertReady();
         this.assertCanReach(chat);
+        if (!this.isAllowlisted(chat)) {
+          throw new Error(`[denied] ${this.chatLabel(chat)} 不在监听名单里，不能主动发表情`);
+        }
         const set = await this.client!.stickerSet(shortName);
         const picked = pickSticker(set.stickers, opts);
         if (!picked) throw new Error(`「${set.title}」里没有可发送的贴纸`);
         const sent = await this.client!.sendSticker(chat, picked.sticker, opts.replyToId);
+        this.rememberOwnId(chat.id, sent.messageId);
         return { messageId: sent.messageId, ...(picked.note ? { note: picked.note } : {}) };
       },
       faveSticker: async (shortName, opts) => {
@@ -1657,6 +1794,7 @@ export class TelegramWorld implements World {
         this.assertReady();
         try {
           const sent = await this.client!.sendText({ id: target, kind: 'user' }, text);
+          this.rememberOwnId(target, sent.messageId);
           return { status: 'done', message: `[notified owner #${sent.messageId}]` };
         } catch (error) {
           // 收件人填错（找不到该用户等）同样不让流程卡住
@@ -1690,8 +1828,10 @@ export class TelegramWorld implements World {
       listLocalStickers: async (limit) => {
         const dir = this.resourceDirs().sticker;
         if (!dir) return [];
-        // 不按格式过滤——jpg/gif 也能发，只是形态不同（面板/工具里标出来）
-        return scanRecent(dir, limit).filter((file) => isLocalStickerUsable(file.path));
+        // 附带 form 标注（sticker / gif / photo），让工具准确显示发出去的形态
+        return scanRecent(dir, limit)
+          .filter((file) => isLocalStickerUsable(file.path))
+          .map((file) => ({ ...file, form: localStickerForm(file.path) ?? 'sticker' }));
       },
       stickerTagSummary: () => this.stickerTagSummary(),
       nextUntaggedStickers: (count) => this.nextUntaggedStickers(count),
@@ -1707,7 +1847,7 @@ export class TelegramWorld implements World {
           }))
           .filter((row) => byName.has(row.name));
         const saved = this.stickerTags.save(rows);
-        return { ...this.stickerTagSummary(), saved };
+        return { ...this.stickerTagSummary(files), saved };
       },
       searchGifs: async (query, limit) => {
         this.assertReady();
@@ -1716,12 +1856,19 @@ export class TelegramWorld implements World {
       sendGif: async (chat, query, index) => {
         this.assertReady();
         this.assertCanReach(chat);
+        if (!this.isAllowlisted(chat)) {
+          throw new Error(`[denied] ${this.chatLabel(chat)} 不在监听名单里，不能主动发 GIF`);
+        }
         const sent = await this.client!.sendGif(chat, query, index);
+        this.rememberOwnId(chat.id, sent.messageId);
         return { messageId: sent.messageId, ...(sent.title ? { title: sent.title } : {}) };
       },
       sendLocalSticker: async (chat, filePath, opts) => {
         this.assertReady();
         this.assertCanReach(chat);
+        if (!this.isAllowlisted(chat)) {
+          throw new Error(`[denied] ${this.chatLabel(chat)} 不在监听名单里，不能主动发表情`);
+        }
         const stickerDir = this.resourceDirs().sticker;
         if (!stickerDir) throw new Error('还没配置「表情包目录」，没法发本地表情（设置 → 媒体目录）');
         // 与 send_media 同一套发送校验：emoji 目录里放个符号链接也绕不过去
@@ -1735,14 +1882,40 @@ export class TelegramWorld implements World {
         const form = localStickerForm(resolved.path);
         if (!form) throw new Error('本地表情只支持 png / webp / tgs / webm（表情）、gif（动图）、jpg（图片）');
 
+        // 群里放行贴纸与 GIF 动图；jpg 照片按文件策略校验（群/频道/bot 不发文件/图片）
+        const policy = await this.checkPolicy(chat, actionForLocalSticker(form));
+        if (policy.verdict === 'deny') {
+          throw new Error(`[denied] ${policy.reason ?? '这里不能发图片/文件'}`);
+        }
+        if (policy.verdict === 'ask') {
+          const out = await this.guardOp(
+            'send_file',
+            this.cfg.fileByWhitelisted,
+            `给 ${this.chatLabel(chat)} 发送本地图片：${basename(resolved.path)}`,
+            String(chat.id),
+            async () => {
+              const sent = await this.client!.sendFile(chat, resolved.path, {
+                ...(opts.replyToId ? { replyToId: opts.replyToId } : {}),
+              });
+              this.rememberOwnId(chat.id, sent.messageId);
+              return `[sticker sent #${sent.messageId} → ${this.chatLabel(chat)}]`;
+            },
+          );
+          if (out.status === 'pending') return { messageId: 0, form, pendingMessage: out.message };
+          if (out.status === 'denied') throw new Error(out.message);
+          return { messageId: 0, form };
+        }
+
         // png/webp/tgs/webm 走 sticker 属性；gif 当动图；jpg 当普通照片
         if (form === 'sticker') {
           const sent = await this.client!.sendLocalSticker(chat, resolved.path, opts);
+          this.rememberOwnId(chat.id, sent.messageId);
           return { messageId: sent.messageId, form };
         }
         const sent = await this.client!.sendFile(chat, resolved.path, {
           ...(opts.replyToId ? { replyToId: opts.replyToId } : {}),
         });
+        this.rememberOwnId(chat.id, sent.messageId);
         return { messageId: sent.messageId, form };
       },
     });
@@ -1783,25 +1956,26 @@ export class TelegramWorld implements World {
       }
     }
     const request = this.approvals.request(kind, summary, target, run);
+    const hasApprover = Number(this.cfg.approverUserId) > 0 || this.ownerIds().length > 0;
+    const hint = hasApprover
+      ? '主人回什么系统会自动认。'
+      : '（注意：尚未在「行为 → 主人」里配置主人 Telegram ID，配置后系统才能识别主人的审批回复）';
     return {
       status: 'pending',
-      message: `[needs approval] 这件事要先问主人。\n`
+      message: `[needs approval] 这件事要先问主人（审批码 ${request.code}）。\n`
         + `（系统只登记等待，不替你说话）你自己去跟主人说一声，用你自己的话，怎么问随你；`
-        + `对方那边先稳住，别提问号、别提流程。主人回什么系统会自动认。`,
+        + `对方那边先稳住，别提问号、别提流程。${hint}`,
     };
   }
 
-  /** 审批人判定：显式配置优先，否则白名单里的用户都算。 */
+  /** 审批人判定：仅认显式 approverUserId 或配置的主人 ID（ownerUserIds / ownerUserId），不放开给普通白名单用户。 */
   private isApproverMessage(msg: Msg): boolean {
     const sender = msg.senderId ?? msg.chatId;
     // 只在私聊里认：群里说话不算点头
     if (msg.chatKind !== 'user' || msg.chatId !== sender) return false;
     const explicit = Number(this.cfg.approverUserId);
     if (explicit > 0) return sender === explicit;
-    // 没配审批人时，主人 ID（收通知的那个）优先
-    const owner = this.ownerIds()[0];
-    if (owner) return sender === owner;
-    return enabledIds(this.cfg.allowUsers).has(sender);
+    return this.ownerIds().includes(sender);
   }
 
   private isAllowlisted(chat: ChatRef): boolean {
@@ -1835,9 +2009,11 @@ export class TelegramWorld implements World {
       }
     };
 
+    const isFileSend = pending.kind === 'send_file';
+
     if (reply === 'deny') {
       this.log.info('主人不同意，已取消', { kind: pending.kind });
-      await say('行，那就不发了。');
+      await say(isFileSend ? '行，那就不发了。' : '行，那就不做了。');
       return;
     }
 
@@ -1849,10 +2025,10 @@ export class TelegramWorld implements World {
     try {
       const done = await pending.run();
       this.log.info('主人同意，已执行', { kind: pending.kind, reply });
-      await say(reply === 'delegate' ? '那我看着办了。' : '好，发了。');
+      await say(reply === 'delegate' ? '那我看着办了。' : isFileSend ? '好，发了。' : '好，已经处理好了。');
       this.log.debug('执行回执', { done });
     } catch (error) {
-      await say(`没发出去：${errText(error)}`);
+      await say(`${isFileSend ? '没发出去' : '没办成'}：${errText(error)}`);
     }
   }
 
@@ -2046,9 +2222,9 @@ export class TelegramWorld implements World {
           label: zh ? '连接' : 'Link',
           state: conn?.status === 'online'
             ? 'online'
-            : conn?.status === 'connecting'
+            : conn?.status === 'connecting' || conn?.status === 'reconnecting'
               ? 'loading'
-              : conn?.status === 'error' || conn?.status === 'revoked'
+              : conn?.status === 'error' || conn?.status === 'revoked' || conn?.status === 'banned'
                 ? 'error'
                 : 'offline',
           ...(conn?.detail ? { hint: conn.detail } : {}),
@@ -2155,6 +2331,12 @@ export class TelegramWorld implements World {
       submitPassword: async (password) => this.requireAuth().submitPassword(password),
       logout: async () => {
         const status = await this.requireAuth().logout();
+        this.botChatCache.clear();
+        this.ownMessageIds.clear();
+        this.quoteCache.clear();
+        this.convCache = undefined;
+        this.contactsCache = undefined;
+        this.envCache = undefined;
         return status;
       },
       setCredentials: async (apiId, apiHash) => {
@@ -2175,12 +2357,14 @@ export class TelegramWorld implements World {
           .split(/[\s,;]+/)
           .map((s) => s.trim())
           .filter(Boolean)
-          .map((s) => Number(s.replace(/^[+-]?(?=\d)/, '')))
-          .filter((n) => Number.isFinite(n) && n !== 0)
+          .map((s) => Number(s.replace(/^\+(?=\d)/, '')))
+          .filter((n) => Number.isInteger(n) && n !== 0)
           .map((id) => ({ id, enabled: true }));
         const nextUsers = parse(users);
         const nextChats = parse(chats);
         this.ctx.persist({ allowUsers: nextUsers, allowChats: nextChats });
+        this.convCache = undefined;
+        this.envCache = undefined;
         return `白名单已更新：私聊 ${nextUsers.length} 个、群/频道 ${nextChats.length} 个（立即生效）。`;
       },
       listDialogs: async (limit) => {
@@ -2190,7 +2374,7 @@ export class TelegramWorld implements World {
       depsStatus: async () => ({ ...probeDeps(this.packageRoot, this.depsInstaller.isRunning()), dir: this.packageRoot }),
       startDepsInstall: () => {
         const started = this.depsInstaller.start();
-        if (started) this.log.warn('开始安装依赖（npm install + build:webui）', { dir: this.ctx.packageDir });
+        if (started) this.log.warn('开始安装依赖（npm install + build:webui）', { dir: this.packageRoot });
         return started;
       },
       depsProgress: () => this.depsInstaller.status(),
@@ -2291,7 +2475,8 @@ export class TelegramWorld implements World {
         this.convCache = undefined;
         const configured = Object.values(next).filter(Boolean).length;
         const parts = [`已保存 ${configured} 个目录`];
-        if (cleared.length) parts.push(`${cleared.length} 个路径不存在，已重置为未配置：${cleared.join('、')}`);
+        if (cleared.length) parts.push(`${cleared.length} 个目录未保存（已置空）：${cleared.join('、')}`);
+        if (notes.length) parts.push(`提醒：${notes.join('；')}`);
         return parts.join('；');
       },
       openDir: (kind) => {
@@ -2314,9 +2499,8 @@ export class TelegramWorld implements World {
         return { files: stats.files, bytes: stats.bytes, keepHours: Number.isFinite(keep) ? keep : 0, path };
       },
       cleanupCache: (opts) => this.cleanupMedia(opts),
-      stickerStatus: async (limit) => {
+      stickerStatus: async (_limit) => {
         const dir = this.resourceDirs().sticker;
-        const files = this.localStickerFiles();
         const tags = this.stickerTagSummary();
         let installed: Array<{ shortName: string; title: string; count: number }> = [];
         let faved = 0;
@@ -2378,6 +2562,13 @@ export class TelegramWorld implements World {
         if (Object.keys(config).length) this.ctx.persist(config as Record<string, never>);
         if (Object.keys(guard).length) {
           this.ctx.persist({ guard: { ...this.cfg.guard, ...guard } });
+        }
+        // 热生效：保存行为开关后立即同步在线状态、审计日志、定时补课与审批 TTL
+        if (config.presence !== undefined) this.applyPresence();
+        if (config.auditLog !== undefined) this.audit.setEnabled(this.cfg.auditLog === true);
+        if (config.catchUp !== undefined) this.applyCatchUpTimer();
+        if (config.approvalTtlMinutes !== undefined) {
+          this.approvals.setTtlMs(Math.max(1, Number(this.cfg.approvalTtlMinutes) || 5) * 60_000);
         }
         this.envCache = undefined;
         return {

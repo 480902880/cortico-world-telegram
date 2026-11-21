@@ -64,6 +64,11 @@ console.log('\n# 每会话限流');
 
   await limiter.acquire(2);
   eq('不同会话不互相等', slept, [1000]);
+
+  // 并发 acquire 串行排队，不会同时算出相同等待后一起突发
+  const concurrent = Promise.all([limiter.acquire(3), limiter.acquire(3)]);
+  await concurrent;
+  eq('并发同会话第二次会乖乖等 1000ms', slept, [1000, 1000]);
 }
 
 console.log('\n# 全局每分钟上限');

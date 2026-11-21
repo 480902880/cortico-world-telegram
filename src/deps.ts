@@ -275,10 +275,17 @@ export class DepsInstaller {
       const prodOnly = args.includes('--prod') || args.includes('--omit=dev');
       this.push(`$ ${manager.label} ${args.join(' ')}`);
       let child;
+      const errLines: string[] = [];
       try {
-        child = spawn(manager.command, command, {
+        const useShell = process.platform === 'win32' && manager.kind !== 'bundled-pnpm';
+        // Windows 下 shell: true 传入含空格的路径（如 C:\Program Files\nodejs\npm.cmd）必须加引号，否则 cmd.exe 解析截断
+        const bin = useShell && /\s/.test(manager.command) && !manager.command.startsWith('"')
+          ? `"${manager.command}"`
+          : manager.command;
+        child = spawn(bin, command, {
           cwd,
-          shell: process.platform === 'win32' && manager.kind !== 'bundled-pnpm',
+          shell: useShell,
+          windowsHide: true,
           env: {
             ...process.env,
             ...manager.env,
@@ -294,11 +301,18 @@ export class DepsInstaller {
       }
       this.child = child;
       child.stdout?.on('data', (chunk: Buffer) => this.push(chunk.toString()));
-      child.stderr?.on('data', (chunk: Buffer) => this.push(chunk.toString()));
+      child.stderr?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        this.push(text);
+        if (errLines.length < 12) errLines.push(text.trim());
+      });
       child.on('error', (error) => reject(new Error(`依赖安装启动失败：${error.message}`)));
       child.on('close', (code) => {
         if (code === 0) resolve();
-        else reject(new Error(`${manager.label} ${args.join(' ')} 退出码 ${code}`));
+        else {
+          const tail = errLines.filter(Boolean).slice(-2).join(' | ').slice(0, 200);
+          reject(new Error(`${manager.label} ${args.join(' ')} 退出码 ${code}${tail ? `（${tail}）` : ''}`));
+        }
       });
     });
   }
@@ -369,10 +383,10 @@ export function resolvePackageManager(execPath = process.execPath): PackageManag
     }
   }
 
-  const pnpm = findOnPath(process.platform === 'win32' ? 'pnpm' : 'pnpm');
+  const pnpm = findOnPath('pnpm');
   if (pnpm) return { kind: 'pnpm', command: pnpm, baseArgs: [], env: {}, label: '系统 pnpm' };
 
-  const npm = findOnPath(process.platform === 'win32' ? 'npm' : 'npm');
+  const npm = findOnPath('npm');
   if (npm) return { kind: 'npm', command: npm, baseArgs: [], env: {}, label: '系统 npm' };
 
   return null;

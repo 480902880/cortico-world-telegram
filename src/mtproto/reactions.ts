@@ -15,8 +15,11 @@ export interface RawReactionUpdate {
   peer?: unknown;
   msgId?: unknown;
   messageId?: unknown;
-  reactions?: { results?: Array<{ reaction?: { emoticon?: unknown; documentId?: unknown }; count?: unknown }> };
-  recentReactions?: Array<{ userId?: unknown; reaction?: unknown[] }>;
+  reactions?: {
+    results?: Array<{ reaction?: { emoticon?: unknown; documentId?: unknown }; count?: unknown }>;
+    recentReactions?: Array<{ userId?: unknown; peerId?: { userId?: unknown }; reaction?: unknown }>;
+  };
+  recentReactions?: Array<{ userId?: unknown; peerId?: { userId?: unknown }; reaction?: unknown }>;
 }
 
 /** 把 peer 解析成 { id, kind }；由调用方注入（复用 client 里已有的规则）。 */
@@ -45,9 +48,16 @@ export function parseReactionUpdate(raw: RawReactionUpdate, resolvePeer: PeerRes
     else if (item?.reaction?.documentId) emoticons.push('自定义表情');
   }
 
-  const recent = Array.isArray(raw?.recentReactions) ? raw!.recentReactions! : [];
+  // 真实 Telegram TL 把 recentReactions 挂在 raw.reactions.recentReactions，且字段为 peerId.userId；
+  // 同时也兼容顶层 recentReactions / userId 的旧结构
+  const recent = Array.isArray(raw?.reactions?.recentReactions)
+    ? raw!.reactions!.recentReactions!
+    : Array.isArray(raw?.recentReactions)
+      ? raw!.recentReactions!
+      : [];
   const last = recent.length ? recent[recent.length - 1] : undefined;
-  const userId = last?.userId ? Number(last.userId) : undefined;
+  const rawUid = last?.userId ?? last?.peerId?.userId;
+  const userId = rawUid ? Number(rawUid) : undefined;
   // 集合空了 = 所有反应都被取消
   const removed = results.length === 0;
 

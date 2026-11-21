@@ -5,7 +5,7 @@
  * 这里按 `mediaKeepHours` 删旧的——只删我们自己下载/转码的产物，不碰用户配置的素材目录。
  */
 
-import { existsSync, readdirSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, readdirSync, rmdirSync, rmSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -86,6 +86,31 @@ export interface PruneResult {
   removed: number;
   bytes: number;
   kept: number;
+  remainingBytes: number;
+}
+
+/** 清理空子目录（保留 root 本身），避免长期运行累积大量空的 <chatId> 目录。 */
+function pruneEmptySubdirs(root: string, maxDepth = 3): void {
+  if (!root || !existsSync(root)) return;
+  const walk = (dir: string, depth: number): void => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const full = join(dir, entry.name);
+      if (depth < maxDepth) walk(full, depth + 1);
+      try {
+        if (readdirSync(full).length === 0) rmdirSync(full);
+      } catch {
+        // 非空或被占用，忽略
+      }
+    }
+  };
+  walk(root, 0);
 }
 
 /** 目录当前规模：多少文件、占多少字节。 */
@@ -97,6 +122,7 @@ export function cacheStats(root: string): { files: number; bytes: number } {
 /** 清空整个目录（bot 手动"全清"用）。返回删了多少、释放多少。 */
 export function clearMediaDir(root: string): PruneResult {
   const files = listFiles(root);
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
   let removed = 0;
   let bytes = 0;
   for (const file of files) {
@@ -105,7 +131,8 @@ export function clearMediaDir(root: string): PruneResult {
       bytes += file.size;
     }
   }
-  return { removed, bytes, kept: files.length - removed };
+  if (removed > 0) pruneEmptySubdirs(root);
+  return { removed, bytes, kept: files.length - removed, remainingBytes: Math.max(0, totalBytes - bytes) };
 }
 
 /**
@@ -115,7 +142,10 @@ export function clearMediaDir(root: string): PruneResult {
 export function pruneMediaDir(root: string, keepHours: number, now = Date.now()): PruneResult {
   const keepMs = keepHours * 3600_000;
   const files = listFiles(root);
-  if (!Number.isFinite(keepMs) || keepMs <= 0) return { removed: 0, bytes: 0, kept: files.length };
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+  if (!Number.isFinite(keepMs) || keepMs <= 0) {
+    return { removed: 0, bytes: 0, kept: files.length, remainingBytes: totalBytes };
+  }
 
   const expired = selectExpired(files, keepMs, now);
   let removed = 0;
@@ -126,5 +156,6 @@ export function pruneMediaDir(root: string, keepHours: number, now = Date.now())
       bytes += file.size;
     }
   }
-  return { removed, bytes, kept: files.length - removed };
+  if (removed > 0) pruneEmptySubdirs(root);
+  return { removed, bytes, kept: files.length - removed, remainingBytes: Math.max(0, totalBytes - bytes) };
 }

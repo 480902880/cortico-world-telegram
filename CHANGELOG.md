@@ -1,5 +1,45 @@
 # CHANGELOG
 
+## 0.44.0 — 自动跟随系统代理 + 稳定性与安全全面修复
+
+### 网络与代理
+- **开箱自动跟随系统代理（无需开启虚拟网卡 / TUN）**：新增 [src/mtproto/proxy.ts](src/mtproto/proxy.ts)，基于 `teleproto/network` 原生 `HttpProxyTransport` / `SocksTransport` / `MTProxyTransport` 构建动态传输层。
+  - 自动按优先级解析：显式配置 `transport.proxy` → 环境变量（`ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`，尊重 `NO_PROXY=*`）→ **系统代理**（Windows 注册表单端口如 `127.0.0.1:7897`、分协议 `http=/https=/socks=`、本机 PAC；macOS `scutil --proxy`）→ 直连。
+  - 每次建连或断线重连动态感知系统代理变化（2 秒缓存 + 并发去重），中途开关代理软件或切直连无需重启。
+  - 同步移除了登录页关于「必须开启 TUN / 虚拟网卡」的旧提示。
+
+### 核心 Bug 修复
+- **面板与配置**：
+  - 修复「行为」页所有数字项（`ownerUserId`、`maxMediaBytes`、`panelHistoryLimit`、`mergeWindowMs`）未注册收集回调导致无法保存的问题。
+  - 修复登录页「保存白名单」剥离群/频道 ID 负号（`-100…` 变正数）的问题。
+  - 修复「行为」页开关热生效：`typingIndicator` 正式接入发送文字前上报；`presence`、`auditLog`、`catchUp`、`approvalTtlMinutes` 保存后立即生效；`this.cfg` 嵌套配置项补全默认合并。
+  - 修复面板保存/报错提示被 `load()`/`reload()` 覆盖、`api_hash` 标签与服务端校验不一致、历史抽屉快切会话竞态及按钮反馈 8 秒卡死问题。
+- **消息与连接**：
+  - 修复 `peerIdOf()` 将超级群（`PeerChannel`）一律误判为广播频道导致超级群消息被丢弃的问题。
+  - 修复 `SentTracker` 先查无会话区分的 `sentIds` 导致他人跨群同号消息被误判成我方消息并静默丢弃的问题，并增加容量上限与发送失败回滚。
+  - 修复 `handleMessage()` 提前返回分支未推进 `lastSeenId` 导致 10 分钟定时补课重放旧审批回复与自发消息循环的问题（且补课历史不再触发待审批）。
+  - 修复登出或会话失效（`revoked`）后无法原地重新登录的问题（销毁旧客户端停掉后台重连、清空旧 session、通知状态机、重登自动重挂更新处理器）。
+  - 接入 `teleproto` 的 `onDisconnect` / `onReconnecting` / `onReconnect` 钩子，同步状态灯并真正触发断线重连补课。
+  - 修复 `topics()` 传参（适配 `Api.messages.GetForumTopics` 的 `peer` 字段）、话题无引用发消息的 `replyToMsgId`、`forward()` 支持 `UpdateNewChannelMessage`、`UpdateMessageReactions` 提取嵌套 `peerId.userId`、`mentionsUser()` 词边界防误触发。
+  - 修复下载非图片大文件时为嗅探 12 字节魔术头而整文件同步读入内存的问题（改为仅读前 12 字节）。
+- **审批、权限与审计**：
+  - 保留自然语言审批（人情味不变），修正 `"不好"`/`"不能发"` 误判为同意及 `"你好"`/`"book"`/`"know"` 误触发的问题。
+  - 审批人收口为显式 `approverUserId` 或配置的主人 ID（`ownerUserIds` / `ownerUserId`），不再放开给全部白名单用户。
+  - 群消息策略与白名单完整接线：群里放行聊天、语音、翻唱（唱歌目录）、表情包与 GIF，拦截个人资料/文件类及危险操作；`sendMedia`/`sendAlbum`/`sendSticker`/`sendGif`/`sendLocalSticker` 统一校验监听白名单。
+  - 修复审计日志 `withAudit` 抛异常错记 `'done'`、`redactAudit` 手机号正则误伤 `-100…` 超级群 ID，以及 `.env.*` / `id_ecdsa` 发送黑名单遗漏。
+- **工具与兼容**：
+  - 全工具处理器加统一异常兜底；修复 `telegram_install_sticker_set` 忽略 `OpOutcome`、`telegram_list_stickers` 本地形态标注、`stickerMime` 的 `.jpg`/`.gif`、跳过超大图打标签顺延补位、`telegram_block_user` 记录 `reason`。
+  - 修复 Windows 含空格路径的 `DepsInstaller` `spawn`、语音转码 `ffmpegAvailable` 不永久缓存 `false` 与同毫秒文件名碰撞、`InstanceLock` 释放校验与时间戳记录。
+
+### 性能与仓库清理
+- 入站动态 GIF / 动态贴纸 / 超限图片按元信息预过滤，避免整段下载后丢弃；`sendMedia` 处理 blob 句柄只落盘一次；`isDuplicate()` 改为均摊 O(1) 淘汰；收敛无界缓存并串行化 `RateLimiter.acquire()`；消除目录重复同步扫描并清理空媒体缓存子目录。
+- 清理根目录误提交的 0 字节文件（`cd`/`git`/`main`/`npm`）及废弃 `src/icon.svg`；同步更新全部文档与 42 组单元测试。
+
+## 0.43.1–0.43.12 — 市场元数据、CI 校验与发布流水线
+
+- 完善 npm / 市场元数据（`repository` / `homepage` / `bugs` / 中英文 `locales`），图标改为 512px PNG（`assets/icon.png`）。
+- 新增 GitHub Actions `verify.yml`（推送/PR 自动全检）与 `release.yml`（打 `v*` 标签自动校验、打市场 zip 并发布 GitHub Release）。
+
 ## 0.41.3 — 文档与一致性
 
 - README 数字对齐实际：**47 个工具**（原 46）、**17 项行为设置**（原 16）、**7 个资源目录**（原 6）。

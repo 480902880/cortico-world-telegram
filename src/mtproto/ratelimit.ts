@@ -29,10 +29,15 @@ export interface RateLimitOptions {
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+const MAX_CHAT_ENTRIES = 5000;
+const CHAT_TTL_MS = 10 * 60_000;
+
 export class RateLimiter {
   private readonly lastByChat = new Map<number, number>();
   /** 最近一分钟内的发送时刻，升序。 */
   private readonly recent: number[] = [];
+  /** 串行排队：避免并发调用算出相同的 wait 后同时突发。 */
+  private queue: Promise<void> = Promise.resolve();
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -59,12 +64,29 @@ export class RateLimiter {
   }
 
   /** 等到允许为止，然后记账。发送前必须调用。 */
-  async acquire(chatId: number): Promise<void> {
-    const wait = this.waitFor(chatId);
-    if (wait > 0) await this.sleep(wait);
-    const at = this.now();
-    this.lastByChat.set(chatId, at);
-    this.recent.push(at);
+  acquire(chatId: number): Promise<void> {
+    const run = this.queue.then(async () => {
+      const wait = this.waitFor(chatId);
+      if (wait > 0) await this.sleep(wait);
+      const at = this.now();
+      this.lastByChat.set(chatId, at);
+      this.recent.push(at);
+      this.pruneChats(at);
+    });
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  private pruneChats(now: number): void {
+    if (this.lastByChat.size <= MAX_CHAT_ENTRIES) return;
+    for (const [id, at] of this.lastByChat) {
+      if (now - at > CHAT_TTL_MS) this.lastByChat.delete(id);
+    }
+    while (this.lastByChat.size > MAX_CHAT_ENTRIES) {
+      const oldest = this.lastByChat.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastByChat.delete(oldest);
+    }
   }
 
   reset(): void {

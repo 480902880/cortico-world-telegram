@@ -7,7 +7,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
 import { basename, extname, join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -42,21 +42,19 @@ export class FfmpegMissingError extends Error {
   }
 }
 
-/** ffmpeg 是否可用（带缓存，避免每次都 spawn）。 */
-const availability = new Map<string, boolean>();
+/** ffmpeg 是否可用（只缓存 true，避免瞬时超时或运行中刚装好 ffmpeg 后永久判死）。 */
+const availability = new Set<string>();
+let voiceSeq = 0;
 
 export async function ffmpegAvailable(ffmpegPath = 'ffmpeg'): Promise<boolean> {
-  const cached = availability.get(ffmpegPath);
-  if (cached !== undefined) return cached;
-  let ok = false;
+  if (availability.has(ffmpegPath)) return true;
   try {
     await run(ffmpegPath, ['-version'], { timeout: 10_000, windowsHide: true });
-    ok = true;
+    availability.add(ffmpegPath);
+    return true;
   } catch {
-    ok = false;
+    return false;
   }
-  availability.set(ffmpegPath, ok);
-  return ok;
 }
 
 /**
@@ -74,7 +72,8 @@ export async function ensureVoiceOgg(inputPath: string, opts: VoiceConvertOption
   const outDir = opts.outDir ?? join(inputPath, '..');
   mkdirSync(outDir, { recursive: true });
   const stem = basename(inputPath, extname(inputPath)).replace(/[^\w.-]+/g, '_');
-  const out = join(outDir, `${stem}-voice-${Date.now()}.ogg`);
+  voiceSeq = (voiceSeq + 1) % 100_000;
+  const out = join(outDir, `${stem}-voice-${Date.now()}-${voiceSeq}.ogg`);
 
   const args = [
     '-y',
@@ -88,14 +87,26 @@ export async function ensureVoiceOgg(inputPath: string, opts: VoiceConvertOption
     out,
   ];
 
+  const cleanupPartial = (): void => {
+    try {
+      if (existsSync(out)) unlinkSync(out);
+    } catch {
+      // 忽略清理失败
+    }
+  };
+
   try {
     await run(ffmpegPath, args, { timeout: opts.timeoutMs ?? 120_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
   } catch (error) {
+    cleanupPartial();
     const stderr = (error as { stderr?: string }).stderr ?? '';
     const tail = stderr.trim().split('\n').slice(-3).join(' | ');
     throw new Error(`ffmpeg 转码失败${tail ? `：${tail}` : `：${(error as Error).message}`}`);
   }
 
-  if (!existsSync(out) || statSync(out).size === 0) throw new Error('ffmpeg 跑完了但没产出文件');
+  if (!existsSync(out) || statSync(out).size === 0) {
+    cleanupPartial();
+    throw new Error('ffmpeg 跑完了但没产出文件');
+  }
   return { path: out, converted: true, note: `已转码为语音条（opus ${opts.bitrateKbps ?? 48}kbps）` };
 }

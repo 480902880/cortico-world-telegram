@@ -59,8 +59,8 @@ export function behaviorFields(zh: boolean): SettingField[] {
       group: t('主人', 'Owner'),
       label: t('主人 Telegram ID（可留空）'),
       hint: t(
-        '留空 = 由 bot 自己判断（它记得谁是主人）；填了才指定审批与告警的收件账号；填错不影响它认人',
-        'Empty = the bot decides on its own; filled = fixed recipient for approvals and alerts',
+        '用于接收告警通知与敏感操作审批确认（留空时普通白名单用户不能代批）；不影响它日常通过口令认人',
+        'Recipient for alerts and approver for confirmations (when empty, regular allowlisted users cannot approve); does not affect normal recognition',
       ),
       type: 'int',
       min: 0,
@@ -234,14 +234,17 @@ export function applyBehaviorPatch(
 
     if (field.type === 'bool') {
       const value = raw === true || raw === 'true' || raw === 1;
-      if (field.key.startsWith('guard.')) guard[field.key.slice(6)] = value ? 'auto' : 'deny';
-      else config[field.key] = value;
+      config[field.key] = value;
       changed.push(`${field.label} = ${value ? '开' : '关'}`);
       continue;
     }
 
     if (field.type === 'int') {
-      const value = Math.round(Number(raw));
+      const blank = raw === '' || raw === null || raw === undefined;
+      if (blank && field.key !== 'ownerUserId') {
+        throw new Error(`${field.label}：不能为空，请填数字`);
+      }
+      const value = blank ? 0 : Math.round(Number(raw));
       if (!Number.isFinite(value)) throw new Error(`${field.label}：需要数字`);
       const min = field.min ?? Number.MIN_SAFE_INTEGER;
       const max = field.max ?? Number.MAX_SAFE_INTEGER;

@@ -2,7 +2,7 @@
 node_modules/
 describe.json
 
-# 打包产物（默认输出到仓库外 D:\Ai）
+# 打包产物（默认输出到仓库上一级目录）
 *.zip
 release/
 

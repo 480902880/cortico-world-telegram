@@ -39,6 +39,9 @@ export interface PanelDeps {
     hasDist: boolean;
     ready: boolean;
     installing: boolean;
+    dir?: string;
+    manager?: string | null;
+    managerProblem?: string;
   }>;
   /** 一键安装依赖；true = 已开始。 */
   startDepsInstall(): boolean;
@@ -232,7 +235,8 @@ export function createPanel(panel: string, deps: PanelDeps) {
 
         case 'cleanup_cache': {
           const raw = (args[0] ?? {}) as Record<string, unknown>;
-          const hours = Number(raw.hours);
+          const hasHours = raw.hours !== undefined && raw.hours !== null && raw.hours !== '';
+          const hours = hasHours ? Number(raw.hours) : Number.NaN;
           return deps.cleanupCache({
             ...(Number.isFinite(hours) ? { hours } : {}),
             ...(raw.all === true ? { all: true } : {}),
@@ -242,6 +246,11 @@ export function createPanel(panel: string, deps: PanelDeps) {
         case 'sticker_status': {
           const limit = Number(args[0]);
           return deps.stickerStatus(Number.isFinite(limit) && limit > 0 ? Math.min(200, limit) : 60);
+        }
+
+        case 'sticker_tags': {
+          const action = asString(args[0]).trim() || 'summary';
+          return deps.stickerTags(action, args[1]);
         }
 
         case 'behavior_fields':

@@ -44,6 +44,8 @@ try {
     ok('32 位十六进制被替换', !redactAudit(`api_hash=${hash}`).includes(hash));
     ok('长串（session）被替换', !redactAudit('session ' + long).includes(long));
     ok('手机号被替换', !redactAudit('手机 +86 13812345678').includes('13812345678'));
+    ok('超级群 id -1001234567890 不被误打码', redactAudit('chat=-1001234567890').includes('-1001234567890'), redactAudit('chat=-1001234567890'));
+    ok('13 位时间戳不被误打码', redactAudit('ts=1760000000000').includes('1760000000000'), redactAudit('ts=1760000000000'));
     ok('普通文字不动', redactAudit('给张三发了首歌').includes('给张三发了首歌'));
     eq('键值对形式', redactAudit('api_hash=abcdef'), 'api_hash=[redacted]');
   }

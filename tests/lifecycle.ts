@@ -99,6 +99,25 @@ async function main(): Promise<void> {
   const bad = (await invoke('login', 'start_login', ['abc'])) as any;
   ok('非法手机号不会进入 code_sent', bad?.step !== 'code_sent', JSON.stringify(bad?.step));
   ok('给出手机号格式提示', /手机号/.test(String(bad?.detail ?? '')), String(bad?.detail));
+
+  // 回归：set_allowlist 不能把群/频道的负号删掉
+  let persistedAllow: any = null;
+  const w4 = new TelegramWorld({
+    id: 'telegram',
+    cfg: telegramDefaults() as any,
+    timezone: 'Asia/Shanghai',
+    botName: 'probe',
+    botDir: dataDir,
+    packageDir: dataDir,
+    dataDir,
+    repoRoot: dataDir,
+    secret: () => '',
+    storeSecret: () => {},
+    persist: (patch: any) => { persistedAllow = patch; },
+    restart: async () => {},
+  } as any);
+  await w4.webUi('zh').invoke!('login', 'set_allowlist', ['12345', '-1001234567890, -42']);
+  ok('set_allowlist 保留群/频道负号', JSON.stringify(persistedAllow?.allowChats?.map((c: any) => c.id)) === JSON.stringify([-1001234567890, -42]), JSON.stringify(persistedAllow));
   await w3.stop();
 
   console.log(`\n结果：${passed} 通过 / ${failed} 失败`);

@@ -366,7 +366,9 @@ export class InstanceLock {
     try {
       // 只删自己的锁：别把别人刚抢到的锁删了
       const holder = this.readLock();
-      if (!holder || holder.token === this.token || holder.pid === process.pid) {
+      const ownsLock = !holder
+        || (holder.token ? holder.token === this.token : holder.pid === process.pid);
+      if (ownsLock) {
         removeFile(this.paths.lock);
       }
     } finally {
@@ -401,7 +403,8 @@ export class InstanceLock {
 
   private body(): LockFileBody {
     const at = this.now();
-    return { pid: process.pid, since: this.sinceAt ?? at, beat: at, token: this.token };
+    if (this.sinceAt === undefined) this.sinceAt = at;
+    return { pid: process.pid, since: this.sinceAt, beat: at, token: this.token };
   }
 
   private sinceAt?: number;

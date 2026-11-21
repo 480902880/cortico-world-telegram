@@ -28,6 +28,7 @@ export const LIB_MISSING_HINT =
 
 let loaded: LibModule | null = null;
 let eventsMod: Record<string, unknown> | null = null;
+let networkMod: Record<string, unknown> | null = null;
 let loading: Promise<LibModule> | null = null;
 let lastError: string | undefined;
 
@@ -58,7 +59,15 @@ export async function ensureLib(): Promise<LibModule> {
       if (typeof (events.Raw ?? (events.default as any)?.Raw) !== 'function') {
         throw new Error(`${PACKAGE}/events 未导出 Raw`);
       }
+      const network = (await import(`${PACKAGE}/network`)) as Record<string, unknown>;
+      const netBag = (network.NetSocket ? network : (network.default as Record<string, unknown> | undefined)) ?? network;
+      for (const key of ['NetSocket', 'HttpProxyTransport', 'SocksTransport', 'MTProxyTransport', 'ConnectionTCPObfuscated']) {
+        if (typeof netBag[key] !== 'function') {
+          throw new Error(`${PACKAGE}/network 未导出 ${key}`);
+        }
+      }
       eventsMod = events;
+      networkMod = netBag;
       loaded = mod;
       lastError = undefined;
       return mod;
@@ -137,6 +146,25 @@ export class RawEvent {
   }
 }
 
+/** 供 `proxy.ts` 构造动态传输层（依赖未加载时抛人话）。 */
+export function networkExports(): {
+  NetSocket: any;
+  HttpProxyTransport: any;
+  SocksTransport: any;
+  MTProxyTransport: any;
+  ConnectionTCPObfuscated: any;
+} {
+  requireLib();
+  if (!networkMod) throw new Error(LIB_MISSING_HINT);
+  return {
+    NetSocket: networkMod.NetSocket,
+    HttpProxyTransport: networkMod.HttpProxyTransport,
+    SocksTransport: networkMod.SocksTransport,
+    MTProxyTransport: networkMod.MTProxyTransport,
+    ConnectionTCPObfuscated: networkMod.ConnectionTCPObfuscated,
+  };
+}
+
 /** 库版本（未加载时为 'unknown'）。 */
 export function libVersion(): string {
   return String(loaded?.version ?? 'unknown');
@@ -145,8 +173,8 @@ export function libVersion(): string {
 /** 论坛话题方法的命名空间：新 layer 在 messages.*，老 layer 在 channels.*。 */
 export type ForumNamespace = 'messages' | 'channels' | null;
 
-/** 取论坛话题的两个方法（列表 / 按 id）；不支持时返回 null。 */
-export function forumTopics(): { get: any; getById: any } | null {
+/** 取论坛话题的两个方法（列表 / 按 id）及命名空间；不支持时返回 null。 */
+export function forumTopics(): { ns: 'messages' | 'channels'; get: any; getById: any } | null {
   if (!loaded) return null;
   const api = loaded.Api;
   const ns: ForumNamespace = typeof api.messages?.GetForumTopics === 'function'
@@ -159,7 +187,7 @@ export function forumTopics(): { get: any; getById: any } | null {
   const get = bag.GetForumTopics;
   const getById = bag.GetForumTopicsByID;
   if (typeof get !== 'function' || typeof getById !== 'function') return null;
-  return { get, getById };
+  return { ns, get, getById };
 }
 
 /** 供面板/状态展示：当前库、版本、能力缺口。 */

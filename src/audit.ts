@@ -7,7 +7,7 @@
  * 约定：
  *  - JSONL（一行一条），方便 grep / 用脚本统计
  *  - 参数与正文都**脱敏 + 截断**，不写 session、api_hash、手机号
- *  - 文件 0600，超过上限轮转一份（`audit.1.jsonl`），不全量保留
+ *  - 文件 0600，超过上限轮转一份（`audit.jsonl.1`），不全量保留
  */
 
 import { appendFileSync, chmodSync, existsSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -38,8 +38,8 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   // 形似 session 串（很长、base64 风格）与 api_hash（32 位十六进制）
   [/\b[A-Za-z0-9+/=_-]{40,}\b/g, '[redacted-session]'],
   [/\b[a-f0-9]{32}\b/gi, '[redacted-hash]'],
-  // 手机号（+86 138… / 纯 11 位）
-  [/(\+\d{1,3}[\s-]?)?\d{11}\b/g, '[redacted-phone]'],
+  // 手机号（+86 138… / 独立 11 位数字；加前边界避免误伤 -100… 超级群 ID 和 13 位时间戳）
+  [/(?<![\d-])(?:\+\d{1,3}[\s-]?)?\d{11}\b/g, '[redacted-phone]'],
   // 明确的键值对
   [/(api_hash|apiHash|session|password)\s*[=:]\s*\S+/gi, '$1=[redacted]'],
 ];
@@ -82,6 +82,7 @@ export class AuditLog {
   }
 
   private enabledFlag: boolean;
+  private dirEnsured = false;
 
   get isEnabled(): boolean {
     return this.enabledFlag;
@@ -109,7 +110,10 @@ export class AuditLog {
       ...(entry.approval ? { approval: entry.approval } : {}),
     });
     try {
-      mkdirSync(dirname(this.file), { recursive: true });
+      if (!this.dirEnsured) {
+        mkdirSync(dirname(this.file), { recursive: true });
+        this.dirEnsured = true;
+      }
       this.rotateIfNeeded();
       if (!existsSync(this.file)) {
         writeFileSync(this.file, `${line}\n`, { encoding: 'utf8', mode: 0o600 });

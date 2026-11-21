@@ -263,7 +263,7 @@ config.json                  worlds.telegram: { enabled: true, gatewayUrl: "ws:/
 ## 4. 文件结构设计
 
 ```
-D:\Ai\cortico-world-telegram\
+cortico-world-telegram/
 ├─ package.json              name/type/cortico{kind:"world",api:6,icon,webUiClient,webUiStyle,describe}
 ├─ describe.json             自描述：全部工具 + 全部事件（含 unsupported 说明）
 ├─ README.md                 安装/登录/工具表/限制
@@ -605,14 +605,14 @@ session → `data/telegram/session.txt`（**不进 `.env`**，因为它是 400+ 
 ## 10. 开工前需要你点头的 3 件事（已定 2026-11-10）
 
 1. **MTProto 库** → 先跑双库探针（§13.1），六项全 ✔ 的定为 `MT_LIB`，**默认候选 `teleproto`**；业务代码只依赖 `port.ts`，换库零改动。
-2. **落地位置** → 原地重写 `D:\Ai\cortico-world-telegram`（沿用 id `telegram` 与现有 `link:` 接线）；旧 gateway 版移到 `_legacy-gateway/`，不硬删。
+2. **落地位置** → 原地重写 `cortico-world-telegram`（沿用 id `telegram` 与现有 `link:` 接线）；旧 gateway 版移到 `_legacy-gateway/`，不硬删。
 3. **回复门** → 普通聊天默认 `direct`（单调用）；`review`（draft→confirm）作为可选自查门；**高风险操作走独立审批通道**（§13.5），不再把 `confirm` 说成「用户确认」。
 
 ---
 
 ## 11. 回滚方案
 
-- 旧版代码：`D:\Ai\备份\cortico-world-telegram (2).zip`（14.5MB，2026-11-10 14:33）+ 原地 `_legacy-gateway/`。
+- 旧版代码：归档备份包 + 原地 `_legacy-gateway/`。
 - 配置：`config.json` 的 `worlds.telegram` 只增键不删键；回滚时把 `enabled` 置 false 即可停用，
   旧 `gatewayUrl` 字段仍在，旧版包放回即可恢复。
 - 登录态：`data/telegram/session.txt` 删除 = 强制重新登录；不触碰其他 World 的数据目录。

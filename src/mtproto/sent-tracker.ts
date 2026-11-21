@@ -54,10 +54,12 @@ interface Held {
 const HOLD_MS = 2000;
 const WINDOW_MS = 60_000;
 const PENDING_TTL_MS = 120_000;
+const MAX_SENT_IDS = 5000;
 
 export class SentTracker {
   private readonly pending = new Map<string, PendingSend>();
-  private readonly sentIds = new Set<number>();
+  /** `${chatId}:${messageId}`（未知会话时 `*:${messageId}`），按插入顺序有上限，防内存泄漏与跨群撞号。 */
+  private readonly sentIds = new Set<string>();
   /** chatId → 最近一次本客户端在该会话发送的毫秒时间。 */
   private readonly lastSendAt = new Map<number, number>();
   private readonly held = new Map<number, Held>();
@@ -74,6 +76,33 @@ export class SentTracker {
     this.lastSendAt.set(chatId, now);
   }
 
+  /** 发送 RPC 失败时回滚预登记，避免随后 60s 内 Desktop/手机发的消息被误判为我方。 */
+  cancelSend(randomId: bigint): void {
+    const key = randomId.toString();
+    const job = this.pending.get(key);
+    if (!job) return;
+    this.pending.delete(key);
+    if (this.lastSendAt.get(job.chatId) === job.at) {
+      this.lastSendAt.delete(job.chatId);
+    }
+  }
+
+  /** 已知发送成功拿到 (chatId, messageId) 时补记，覆盖不走 updateMessageID 的发送路径（如相册）。 */
+  recordSentId(chatId: number, messageId: number, now = Date.now()): void {
+    if (messageId <= 0) return;
+    this.addSentKey(`${chatId}:${messageId}`);
+    this.lastSendAt.set(chatId, Math.max(this.lastSendAt.get(chatId) ?? 0, now));
+  }
+
+  private addSentKey(key: string): void {
+    this.sentIds.add(key);
+    while (this.sentIds.size > MAX_SENT_IDS) {
+      const oldest = this.sentIds.values().next().value;
+      if (oldest === undefined) break;
+      this.sentIds.delete(oldest);
+    }
+  }
+
   /**
    * `updateMessageID` 到达：把 messageId 记为本客户端所发，并尝试认领隔离队列里的同 id 消息。
    * 返回被认领的消息 id（没有则 null）。
@@ -82,10 +111,14 @@ export class SentTracker {
     const key = randomId.toString();
     const job = this.pending.get(key);
     this.pending.delete(key);
-    if (job) this.lastSendAt.set(job.chatId, Math.max(this.lastSendAt.get(job.chatId) ?? 0, Date.now()));
-    this.sentIds.add(messageId);
+    if (job) {
+      this.lastSendAt.set(job.chatId, Math.max(this.lastSendAt.get(job.chatId) ?? 0, Date.now()));
+      this.addSentKey(`${job.chatId}:${messageId}`);
+    } else {
+      this.addSentKey(`*:${messageId}`);
+    }
     for (const [token, h] of this.held) {
-      if (h.input.messageId === messageId) {
+      if (h.input.messageId === messageId && (!job || h.input.chatId === job.chatId)) {
         this.held.delete(token);
         this.tokens.set(token, 'ours');
         return messageId;
@@ -100,8 +133,11 @@ export class SentTracker {
   /** 判定一条消息。 */
   classify(input: ClassifyInput, now = Date.now()): Verdict {
     this.sweep(now);
-    if (this.sentIds.has(input.messageId)) return { verdict: 'ours' };
+    // 非 out 消息永远是别人发来的（绝不能因跨群 messageId 撞号误判为我方）
     if (!input.out) return { verdict: 'incoming' };
+    if (this.sentIds.has(`${input.chatId}:${input.messageId}`) || this.sentIds.has(`*:${input.messageId}`)) {
+      return { verdict: 'ours' };
+    }
 
     // out 消息：先看这个会话里有没有我方正在等认领的发送
     if (this.hasPendingFor(input.chatId)) {

@@ -9,6 +9,7 @@ import type { MediaInfo, Msg } from '../mtproto/port.ts';
 
 /** 秒 → `1:05` / `1:02:03`。 */
 export function formatDuration(totalSec: number): string {
+  if (!Number.isFinite(totalSec) || totalSec < 0) return '0:00';
   const sec = Math.max(0, Math.round(totalSec));
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);

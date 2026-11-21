@@ -67,7 +67,7 @@ export interface ToolDeps {
     opts: { index?: number; emoji?: string; unfave?: boolean },
   ): Promise<{ note?: string }>;
   favedStickers(): Promise<StickerInfo[]>;
-  listLocalStickers(limit: number): Promise<ResourceFile[]>;
+  listLocalStickers(limit: number): Promise<Array<ResourceFile & { form?: string }>>;
   /** 标签进度：总数 / 已标 / 待标 / 形态分布。 */
   stickerTagSummary(): { total: number; tagged: number; pending: number; byForm: { sticker: number; gif: number; photo: number } };
   /** 取下一批待打标签的表情（带图片字节，供模型看图）。 */
@@ -86,8 +86,8 @@ export interface ToolDeps {
   };
   searchGifs(query: string, limit: number): Promise<GifResult[]>;
   sendGif(chat: ChatRef, query: string, index: number): Promise<{ messageId: number; title?: string }>;
-  sendLocalSticker(chat: ChatRef, filePath: string, opts: { emoji?: string; replyToId?: number }): Promise<{ messageId: number; form?: string }>;
-  /** 装卸贴纸包：走审批（guard.stickerSetWrite）。 */
+  sendLocalSticker(chat: ChatRef, filePath: string, opts: { emoji?: string; replyToId?: number }): Promise<{ messageId: number; form?: string; pendingMessage?: string }>;
+  /** 装卸贴纸包（直接执行，不再走审批）。 */
   installStickerSet(shortName: string, install: boolean): Promise<OpOutcome>;
   // ── S-02 主人身份 ──────────────────────────────────────
   /** 把一条消息发到主人私聊（目标固定，模型改不了）。 */
@@ -102,7 +102,7 @@ export interface ToolDeps {
   commonChats(user: ChatRef, limit: number): Promise<ChatRef[]>;
   addContact(user: ChatRef, opts: { firstName: string; lastName?: string; phone?: string }): Promise<OpOutcome>;
   deleteContact(user: ChatRef): Promise<OpOutcome>;
-  blockUser(user: ChatRef): Promise<OpOutcome>;
+  blockUser(user: ChatRef, reason?: string): Promise<OpOutcome>;
   unblockUser(user: ChatRef): Promise<OpOutcome>;
   blockedUsers(limit: number): Promise<UserInfo[]>;
   /** minutes: 0 = 取消静音，-1 = 永久，>0 = 静音这么多分钟。返回 muteUntil。 */
@@ -935,7 +935,14 @@ export const TELEGRAM_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
 ];
 
 function fail(text: string): ToolOutcome {
-  return { text: `[failed] ${text}`, failed: true };
+  const clean = text.replace(/^\[failed\]\s*/i, '');
+  return { text: `[failed] ${clean}`, failed: true };
+}
+
+function optionalNonNegativeInt(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
 }
 
 const KIND_LABEL: Record<string, string> = { user: '私聊', group: '群', channel: '频道' };
@@ -966,7 +973,7 @@ function renderLine(m: Msg): string {
 }
 
 export function createTools(deps: ToolDeps): ToolDef[] {
-  return [
+  const defs: ToolDef[] = [
     {
       ...STATUS_DECL,
       handler: async () => deps.status(),
@@ -1160,7 +1167,8 @@ export function createTools(deps: ToolDeps): ToolDef[] {
       handler: async (args) => {
         const resolved = await deps.resolveChat(args.user);
         if (!resolved.ok) return fail(resolved.error);
-        const out = await deps.blockUser(resolved.chat);
+        const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+        const out = await deps.blockUser(resolved.chat, reason || undefined);
         return out.status === 'denied' ? fail(out.message) : out.message;
       },
     },
@@ -1472,6 +1480,7 @@ export function createTools(deps: ToolDeps): ToolDef[] {
               ...(emoji ? { emoji } : {}),
               ...reply,
             });
+            if (sent.pendingMessage) return sent.pendingMessage;
             const id = sent.messageId > 0 ? ` #${sent.messageId}` : '（id 未确认）';
             const formLabel = sent.form === 'gif' ? '动图' : sent.form === 'photo' ? '图片' : '表情';
             return `[sticker sent${id} → ${chatLabel(resolved.chat)}]（本地${formLabel}：${localPath}）`;
@@ -1481,10 +1490,10 @@ export function createTools(deps: ToolDeps): ToolDef[] {
         }
         if (!shortName) return fail('要么给 short_name（Telegram 包）+ index/emoji，要么给 local_path（本地文件）');
 
-        const index = Number(args.index);
+        const index = optionalNonNegativeInt(args.index);
         try {
           const sent = await deps.sendSticker(resolved.chat, shortName, {
-            ...(Number.isFinite(index) ? { index } : {}),
+            ...(index !== undefined ? { index } : {}),
             ...(emoji ? { emoji } : {}),
             ...reply,
           });
@@ -1525,7 +1534,7 @@ export function createTools(deps: ToolDeps): ToolDef[] {
         if (!resolved.ok) return fail(resolved.error);
         const query = typeof args.query === 'string' ? args.query.trim() : '';
         if (!query) return fail('query 不能为空');
-        const index = Number.isFinite(Number(args.index)) ? Number(args.index) : 0;
+        const index = optionalNonNegativeInt(args.index) ?? 0;
         try {
           const sent = await deps.sendGif(resolved.chat, query, index);
           const id = sent.messageId > 0 ? ` #${sent.messageId}` : '（id 未确认）';
@@ -1572,11 +1581,11 @@ export function createTools(deps: ToolDeps): ToolDef[] {
       handler: async (args) => {
         const shortName = typeof args.short_name === 'string' ? args.short_name.trim() : '';
         if (!shortName) return fail('short_name 不能为空');
-        const index = Number(args.index);
+        const index = optionalNonNegativeInt(args.index);
         const emoji = typeof args.emoji === 'string' ? args.emoji.trim() : '';
         try {
           const out = await deps.faveSticker(shortName, {
-            ...(Number.isFinite(index) ? { index } : {}),
+            ...(index !== undefined ? { index } : {}),
             ...(emoji ? { emoji } : {}),
             ...(args.unfave === true ? { unfave: true } : {}),
           });
@@ -1593,8 +1602,8 @@ export function createTools(deps: ToolDeps): ToolDef[] {
         if (!shortName) return fail('short_name 不能为空');
         const install = args.install !== false;
         try {
-          await deps.installStickerSet(shortName, install);
-          return `[表情包] 已${install ? '安装' : '卸载'} ${shortName}`;
+          const out = await deps.installStickerSet(shortName, install);
+          return out.status === 'denied' ? fail(out.message) : out.message;
         } catch (error) {
           return fail(`${install ? '安装' : '卸载'}失败：${error instanceof Error ? error.message : String(error)}`);
         }
@@ -1653,7 +1662,8 @@ export function createTools(deps: ToolDeps): ToolDef[] {
       ...CLEANUP_DECL,
       handler: async (args) => {
         const all = args.all === true;
-        const hours = Number(args.hours);
+        const hasHours = args.hours !== undefined && args.hours !== null && args.hours !== '';
+        const hours = hasHours ? Number(args.hours) : Number.NaN;
         try {
           const result = await deps.cleanupMedia({
             ...(Number.isFinite(hours) ? { hours } : {}),
@@ -1855,6 +1865,17 @@ export function createTools(deps: ToolDeps): ToolDef[] {
       },
     },
   ];
+  // 统一兜底：resolveChat 或任意操作抛出未捕获异常时，一律返回 { failed: true } 而不是把宿主搞崩
+  return defs.map((def) => ({
+    ...def,
+    handler: async (args, ctx) => {
+      try {
+        return await def.handler(args, ctx);
+      } catch (error) {
+        return fail(error instanceof Error ? error.message : String(error));
+      }
+    },
+  })) as ToolDef[];
 }
 
 /** 只读工具不写审计（否则日志会被查消息刷满）。 */
@@ -1873,16 +1894,31 @@ export function withAudit(defs: ToolDef[], audit?: (entry: { tool: string; resul
       ...def,
       handler: async (args, ctx) => {
         let result: ToolOutcome | string = '';
+        let threwError: unknown;
+        let threw = false;
         try {
           result = await def.handler(args, ctx);
           return result;
+        } catch (error) {
+          threw = true;
+          threwError = error;
+          throw error;
         } finally {
           try {
-            const text = typeof result === 'string' ? result : (result.text ?? '');
-            const failed = typeof result === 'string' ? false : result.failed === true;
+            const text = threw
+              ? (threwError instanceof Error ? threwError.message : String(threwError))
+              : (typeof result === 'string' ? result : (result.text ?? ''));
+            const failed = threw || (typeof result !== 'string' && result.failed === true);
+            const status = failed
+              ? 'failed'
+              : text.startsWith('[needs approval]')
+                ? 'pending'
+                : text.startsWith('[denied]')
+                  ? 'denied'
+                  : 'done';
             audit({
               tool: def.name,
-              result: failed ? 'failed' : 'done',
+              result: status,
               ...(args && Object.keys(args).length ? { args: JSON.stringify(args) } : {}),
               ...(text ? { outcome: String(text) } : {}),
             });

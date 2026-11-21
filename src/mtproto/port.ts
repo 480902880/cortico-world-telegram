@@ -101,7 +101,7 @@ export interface HistoryOptions {
 
 /** 连接状态。`revoked` = 会话被其他设备终止，必须停机提示重登（PLAN §12.3）。 */
 export interface ConnectionState {
-  status: 'offline' | 'connecting' | 'online' | 'error' | 'revoked' | 'banned';
+  status: 'offline' | 'connecting' | 'reconnecting' | 'online' | 'error' | 'revoked' | 'banned';
   /** 进入该状态的 unix 毫秒。 */
   since: number;
   detail?: string;

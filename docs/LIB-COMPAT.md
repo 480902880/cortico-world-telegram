@@ -1,8 +1,8 @@
 # MTProto 库兼容性评估（P0.0）
 
 - 探针：`scripts/probe.mts`（`npm run probe`，离线静态段）
-- 环境：Windows / Node v23.11.1 / tsx 4.x / 项目 `D:\Ai\cortico-world-telegram`
-- 实测时间：2026-11-10 19:06
+- 环境：Windows / Node 20+ / tsx 4.x
+- 实测时间：2026-11-10（0.44.0 补充验证 `teleproto/network` 传输层与 `messages.GetForumTopics` 参数）
 - 被测：`teleproto@1.233.0`、`telegram@2.26.21`（npm 上是 2.26.22 发布的 GramJS，末版）
 
 ## 1. 静态兼容结果（11/11 全通过，两库相同）
@@ -25,9 +25,10 @@
 
 | # | 差异 | 影响 | 处置 |
 |---|---|---|---|
-| 1 | **论坛话题换了命名空间**：gramjs 用 `Api.channels.GetForumTopics / GetForumTopicsByID`；teleproto 已迁到 `Api.messages.GetForumTopics / GetForumTopicsByID` | 直接抄 gramjs 示例会在 teleproto 上报 “not a function” | 适配层 `impl/` 里做命名空间探测，业务层只调 `port.topics()` |
+| 1 | **论坛话题换了命名空间与参数名**：gramjs 用 `Api.channels.GetForumTopics({ channel })`；teleproto 已迁到 `Api.messages.GetForumTopics({ peer })` | 直接抄 gramjs 示例会报 “not a function” 或 “Required object peer is undefined” | 适配层 `lib.ts` 返回命名空间 `ns`，`client.ts` 按 `ns` 自动传 `peer` 或 `channel`，业务层只调 `port.topics()` |
 | 2 | **`message` 构造器已无 `random_id`**（两库一致，现代 layer 移除） | 原计划「用 `message.randomId` 认出自己发的消息」**不成立** | 改用 `updateMessageID{ id, random_id }` 关联（§13.4 已改） |
-| 3 | 包体积/依赖：telegram 2.05MB / 226 files，依赖含 `websocket` `pako` `path-browserify`；teleproto 5.01MB / 433 files，依赖 `cifrante`(native crypto) `socks` `buffer` `big-integer` `node-localstorage` `mime`，启动日志 `crypto: native` | 安装体积、原生加密路径不同 | teleproto 走 Node 原生 crypto，CPU 开销更低；体积大 3MB 可接受 |
+| 3 | **传输层与代理**：teleproto 1.233.0 通过 `teleproto/network` 提供 `HttpProxyTransport` / `SocksTransport` / `MTProxyTransport` / `NetSocket`（旧 `proxy` 选项已标 `@deprecated`） | 传 `transport` 取代旧 `proxy` 可动态切换系统代理与直连 | `lib.ts` 懒加载 `teleproto/network`，`proxy.ts` 基于 `NetSocket` 构建 `AutoProxyTransport` |
+| 4 | 包体积/依赖：telegram 2.05MB / 226 files；teleproto 5.01MB / 433 files，依赖 `cifrante`(native crypto) `socks` `buffer` `big-integer` `node-localstorage` `mime`，启动日志 `crypto: native` | 安装体积、原生加密路径不同 | teleproto 走 Node 原生 crypto，CPU 开销更低；体积大 3MB 可接受 |
 
 ## 3. 结论
 

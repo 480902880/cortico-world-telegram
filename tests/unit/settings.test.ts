@@ -93,6 +93,15 @@ console.log('\n# 校验与规整');
   }
   ok('非法数字抛错', threwInt);
 
+  let threwBlank = false;
+  try {
+    applyBehaviorPatch({ mergeWindowMs: '' }, true);
+  } catch {
+    threwBlank = true;
+  }
+  ok('必填数字留空抛错（不静默变 0）', threwBlank);
+  eq('ownerUserId 留空回 0', applyBehaviorPatch({ ownerUserId: '' }, true).config.ownerUserId, 0);
+
   const unknown = applyBehaviorPatch({ hackThePlanet: true }, true);
   eq('未知键被忽略', Object.keys(unknown.config).length, 0);
   eq('忽略后没有改动', unknown.changed, []);

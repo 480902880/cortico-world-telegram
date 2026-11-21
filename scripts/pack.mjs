@@ -2,7 +2,7 @@
  * 打市场包：只装 src / dist / types / 清单与说明，不含 node_modules、tests、docs。
  *
  * 跑法：npm run pack:release
- * 产物：release/<name>-<version>.zip
+ * 产物：默认输出到仓库上一级目录 `<name>-<version>.zip`（可通过 `RELEASE_DIR` 覆盖）
  *
  * 为什么必须带上 dist/webui.js：
  *   面板 bundle 是包内资产（`cortico.webUiClient`），缺了它 WebUI 渲染不出来，
@@ -38,6 +38,7 @@ if (process.argv.includes('--check')) {
 
 /** 进包的顶层条目。 */
 const INCLUDE = [
+  'assets',
   'src',
   'dist',
   'types',
@@ -99,7 +100,7 @@ function dosTime(date) {
   };
 }
 
-// 产物默认放在仓库**外面**（D:\Ai），别把压缩包混进在用的插件目录
+// 产物默认放在仓库**外面**（上一级目录），别把压缩包混进在用的插件目录
 const outDir = process.env.RELEASE_DIR?.trim() || dirname(root);
 mkdirSync(outDir, { recursive: true });
 const outFile = join(outDir, `${pkg.name}-${pkg.version}.zip`);

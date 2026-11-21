@@ -48,7 +48,7 @@ export interface ApprovalsOptions {
 
 export class Approvals {
   private readonly items = new Map<string, ApprovalRequest>();
-  private readonly ttlMs: number;
+  private ttlMs: number;
   private readonly now: () => number;
   private readonly random: () => number;
 
@@ -56,6 +56,11 @@ export class Approvals {
     this.ttlMs = opts.ttlMs ?? 5 * 60_000;
     this.now = opts.now ?? (() => Date.now());
     this.random = opts.random ?? Math.random;
+  }
+
+  /** 热更新审批有效期（新发起的审批生效）。 */
+  setTtlMs(ttlMs: number): void {
+    if (Number.isFinite(ttlMs) && ttlMs > 0) this.ttlMs = ttlMs;
   }
 
   /** 登记一次待批准操作，返回带码的请求。 */
@@ -160,19 +165,30 @@ export function renderApprovals(list: ApprovalRequest[]): string {
  */
 export type OwnerReply = 'allow' | 'deny' | 'delegate';
 
-const ALLOW_WORDS = [
-  '可以', '行', '好', '好的', '嗯', '发吧', '发', '给吧', '给他', '给她', '同意', '批准', '没问题',
-  'ok', 'okay', 'yes', 'sure', 'fine',
+const ALLOW_PHRASES = [
+  '可以', '好的', '好呀', '好啊', '好吧', '行吧', '行啊', '行呀', '嗯嗯',
+  '发吧', '给吧', '给他', '给她', '同意', '批准', '没问题',
   '发给他', '发给她', '发过去', '去吧', '干吧', '做吧',
 ];
-const DENY_WORDS = [
-  '不行', '不可以', '不要', '不用', '不必', '别', '别发', '算了', '不给', '不许', '不准', '拒绝', '收回',
-  'no', 'nope', 'stop', 'cancel',
+/** 单字肯定只认整句命中，避免「你好 / 早上好 / 出发 / 发现」误批准。 */
+const ALLOW_EXACT = new Set(['好', '行', '嗯', '发']);
+const ALLOW_ENGLISH = ['ok', 'okay', 'yes', 'sure', 'fine'];
+
+const DENY_PHRASES = [
+  '不行', '不可以', '不好', '不能', '不能发', '不发', '不要', '不用', '不必',
+  '别发', '别给', '别删', '别做', '别弄', '别了', '别吧', '算了', '不给', '不许', '不准', '拒绝', '收回',
 ];
+const DENY_EXACT = new Set(['别', '不']);
+const DENY_ENGLISH = ['no', 'nope', 'stop', 'cancel'];
+
 const DELEGATE_WORDS = [
   '随便你', '随你', '你看着办', '你定', '你决定', '你说了算', '看你', '你拿主意', '你自己决定', '随意',
   'up to you', 'your call', 'whatever',
 ];
+
+function hasEnglishWord(raw: string, words: readonly string[]): boolean {
+  return words.some((word) => new RegExp(`(?:^|[^a-z])${word}(?:$|[^a-z])`, 'i').test(raw));
+}
 
 export function classifyOwnerReply(text: string): OwnerReply | null {
   const raw = (text ?? '').trim().toLowerCase();
@@ -189,8 +205,20 @@ export function classifyOwnerReply(text: string): OwnerReply | null {
 
   // allow / deny 只认短回复：一句长话里的"可以"多半是闲聊
   if (flat.length <= 10) {
-    if (DENY_WORDS.some((word) => flat.includes(word.replace(/\s+/g, '')))) return 'deny';
-    if (ALLOW_WORDS.some((word) => flat.includes(word.replace(/\s+/g, '')))) return 'allow';
+    if (
+      DENY_EXACT.has(flat)
+      || DENY_PHRASES.some((word) => flat.includes(word))
+      || hasEnglishWord(raw, DENY_ENGLISH)
+    ) {
+      return 'deny';
+    }
+    if (
+      ALLOW_EXACT.has(flat)
+      || ALLOW_PHRASES.some((word) => flat.includes(word))
+      || hasEnglishWord(raw, ALLOW_ENGLISH)
+    ) {
+      return 'allow';
+    }
   }
   return null;
 }

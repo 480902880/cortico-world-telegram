@@ -9,22 +9,34 @@
  * 这里只做"明显不该填的"拦截，正常子目录一律放行，避免误伤。
  */
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, parse, resolve, sep } from 'node:path';
 
 export type DirCheck = { ok: true; path: string } | { ok: false; reason: string };
 
 function norm(value: string): string {
-  const unified = resolve(value).replace(/[\\/]+$/, '');
+  let target = resolve(value);
+  try {
+    // 展开符号链接 / junction，防止通过软链绕过盘符根或系统目录校验
+    target = realpathSync.native(target);
+  } catch {
+    // 路径不存在时退回 resolve
+  }
+  const unified = target.replace(/[\\/]+$/, '');
   return process.platform === 'win32' ? unified.toLowerCase() : unified;
 }
 
 /** 系统目录清单（存在才比较，避免在别的平台上乱拦）。 */
 function systemRoots(): string[] {
-  const names = ['WINDIR', 'SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'ProgramData'];
-  return names
-    .map((name) => process.env[name])
-    .filter((value): value is string => Boolean(value && isAbsolute(value)))
+  if (process.platform === 'win32') {
+    const names = ['WINDIR', 'SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432', 'ProgramData'];
+    return names
+      .map((name) => process.env[name])
+      .filter((value): value is string => Boolean(value && isAbsolute(value)))
+      .map(norm);
+  }
+  return ['/etc', '/usr', '/bin', '/sbin', '/lib', '/var', '/boot', '/System', '/Library']
+    .filter((dir) => existsSync(dir))
     .map(norm);
 }
 
@@ -38,7 +50,7 @@ function homeRoots(): string[] {
  * 校验一个资源目录能不能用。
  *
  * 拒绝：盘符根（`C:\`）、UNC 共享根、系统目录及其子目录、用户主目录本身。
- * 允许：普通子目录（例如 `D:\Ai\rvc\output`）。
+ * 允许：普通子目录（例如 `D:\media\output`）。
  */
 export function checkResourceDir(raw: string): DirCheck {
   const value = (raw ?? '').trim();
@@ -75,24 +87,33 @@ export function checkResourceDir(raw: string): DirCheck {
   return { ok: true, path: resolve(value) };
 }
 
-/** 目录里文件特别多时给一句提醒（不拦，只提醒）。 */
+/** 目录里文件特别多时给一句提醒（不拦，只提醒；限制扫描深度与目录数，不阻塞主线程）。 */
 export function dirSizeHint(dir: string, limit = 5000): string | undefined {
-  try {
-    let count = 0;
-    // 只看一层：递归数文件在大目录上会很慢
-    const stack = [dir];
-    while (stack.length && count <= limit) {
-      const current = stack.pop()!;
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
-        if (entry.isDirectory()) stack.push(`${current}${sep}${entry.name}`);
-        else count += 1;
-        if (count > limit) break;
-      }
+  const MAX_DIRS = 500;
+  const MAX_DEPTH = 4;
+  let count = 0;
+  let visitedDirs = 0;
+  const stack: Array<{ path: string; depth: number }> = [{ path: dir, depth: 0 }];
+  while (stack.length && count <= limit && visitedDirs < MAX_DIRS) {
+    const current = stack.pop()!;
+    visitedDirs += 1;
+    let entries;
+    try {
+      entries = readdirSync(current.path, { withFileTypes: true });
+    } catch {
+      // 单个无权限子目录跳过，不中断整体统计
+      continue;
     }
-    return count > limit ? `这个目录文件很多（>${limit}），扫描会慢，建议选更具体的子目录` : undefined;
-  } catch {
-    return undefined;
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (current.depth < MAX_DEPTH) stack.push({ path: `${current.path}${sep}${entry.name}`, depth: current.depth + 1 });
+      } else {
+        count += 1;
+      }
+      if (count > limit) break;
+    }
   }
+  return count > limit ? `这个目录文件很多（>${limit}），扫描会慢，建议选更具体的子目录` : undefined;
 }
 
 /** 目录的显示名（面板/日志用）：末两级，避免暴露完整路径。 */

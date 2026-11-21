@@ -4,13 +4,13 @@
  * 解决的问题（规划 §6）：TTS / 绘图 / 视频工具在本地生成文件，Agent 不该去猜路径，
  * 也不该被允许翻整块硬盘。所以：
  *
- *  1. 用户在面板/配置里指定 7 个目录（语音/图片/视频/文件/贴纸/下载/临时）；
+ *  1. 用户在面板/配置里指定 7 个目录（语音/唱歌/图片/视频/文件/贴纸/下载）；
  *  2. 所有本地文件访问都必须落在这些根目录内——按 **realpath** 比较，符号链接、`..` 都逃不出去；
  *  3. 提供「最近生成的文件」扫描与登记索引，Agent 用 `telegram_find_local_media` 拿路径，
  *     再用 `telegram_send_media` 发出去。
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, extname, join, resolve, sep } from 'node:path';
 
 export type ResourceKind = 'voice' | 'song' | 'image' | 'video' | 'file' | 'sticker' | 'download';
@@ -81,10 +81,13 @@ export function isLocalStickerUsable(path: string): boolean {
   return localStickerForm(path) !== null;
 }
 
-/** 本地表情文件 → Telegram 能认的 MIME。 */
+/** 本地表情文件 → 对应的 MIME（供 Telegram 上传与模型看图打标签使用）。 */
 export function stickerMime(path: string): string {
   switch (extname(path).toLowerCase()) {
     case '.webp': return 'image/webp';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.gif': return 'image/gif';
     case '.tgs': return 'application/x-tgsticker';
     case '.webm': return 'video/webm';
     default: return 'image/png';
@@ -130,9 +133,9 @@ function isInside(target: string, root: string): boolean {
 
 /** 无论在哪都不许外发的文件名（等于账号控制权，或凭据）。 */
 const DENY_BASENAMES = new Set([
-  '.env', '.env.local', '.env.production',
+  '.env',
   'session.txt', 'state.json', 'instance.lock', 'resources.json', 'sticker-tags.json',
-  'id_rsa', 'id_ed25519', 'credentials.json', 'config.json', '.npmrc', '.netrc',
+  'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa', 'credentials.json', 'config.json', '.npmrc', '.netrc',
 ]);
 
 /** 密钥类扩展名。 */
@@ -183,7 +186,7 @@ export function resolveForSend(
   }
 
   const name = basename(real).toLowerCase();
-  if (DENY_BASENAMES.has(name) || DENY_EXTS.has(extname(name))) {
+  if (name === '.env' || name.startsWith('.env.') || DENY_BASENAMES.has(name) || DENY_EXTS.has(extname(name))) {
     return { ok: false, error: '该文件禁止发送' };
   }
   for (const dir of policy.denyDirs) {
@@ -218,7 +221,7 @@ export function resolveWithinRoots(
   return { ok: true, path: absolute };
 }
 
-/** 目录状态（一次 stat + 一次 readdir）。 */
+/** 目录状态（一次 access + 一次 readdir）。 */
 export function inspectDir(kind: ResourceKind, path: string): DirStatus {
   const configured = !!path;
   if (!configured) return { kind, path: '', configured: false, exists: false, writable: false, files: 0 };
@@ -227,7 +230,7 @@ export function inspectDir(kind: ResourceKind, path: string): DirStatus {
   let newest: ResourceFile | undefined;
   let writable = true;
   try {
-    readdirSync(path);
+    accessSync(path, constants.W_OK);
   } catch {
     writable = false;
   }
@@ -247,7 +250,7 @@ export function inspectDir(kind: ResourceKind, path: string): DirStatus {
       }
     }
   } catch {
-    // 目录不可读
+    writable = false;
   }
   return { kind, path, configured, exists: true, writable, files, ...(newest ? { newest } : {}) };
 }

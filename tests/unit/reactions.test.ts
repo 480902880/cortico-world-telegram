@@ -132,5 +132,22 @@ console.log('\n# bot 账号也会收到另一类 update');
   eq('同样能解析', parsed?.emoticons, ['👀']);
 }
 
+console.log('\n# 真实 Telegram TL 结构（reactions.recentReactions[].peerId.userId）');
+{
+  const parsed = parseReactionUpdate(
+    {
+      className: 'UpdateMessageReactions',
+      peer: { userId: 123 },
+      msgId: 99,
+      reactions: {
+        results: [emoji('🔥')],
+        recentReactions: [{ peerId: { userId: 456 } }],
+      },
+    },
+    resolve,
+  );
+  eq('能提取嵌套 recentReactions.peerId.userId', parsed?.userId, 456);
+}
+
 console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
 if (failed > 0) process.exitCode = 1;

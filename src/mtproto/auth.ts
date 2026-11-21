@@ -15,6 +15,8 @@ import type { SessionStore } from './session-store.ts';
 export interface AuthPort {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  /** 可选：重新登录前重置已失效/已登出的客户端状态（清空旧 session 与 revoked 标记）。 */
+  prepareLogin?(): Promise<void>;
   sendCode(phone: string): Promise<{ codeHash: string; viaApp: boolean }>;
   signIn(phone: string, codeHash: string, code: string): Promise<'ok' | 'password-needed'>;
   checkPassword(password: string): Promise<void>;
@@ -159,6 +161,7 @@ export class AuthMachine {
       }
       this.phone = raw.replace(/[\s-]/g, '');
       try {
+        await this.port.prepareLogin?.();
         await this.port.connect();
         const { codeHash, viaApp } = await this.port.sendCode(this.phone);
         this.codeHash = codeHash;

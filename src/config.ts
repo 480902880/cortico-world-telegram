@@ -69,19 +69,18 @@ export interface TelegramConfigSection {
   allowChats: TelegramRosterEntry[];
   /** 高危操作策略。 */
   guard: GuardConfig;
-  /** 谁有权回 !ok 批准；0 = 白名单里的第一个用户。 */
+  /** 谁有权批准敏感操作；0 = 按 ownerUserIds / ownerUserId 配置的主人 ID 判定。 */
   approverUserId: number;
   /**
-   * 主人的 Telegram 数字 ID（可多个）。用途是「通知与审批的收件地址」，
-   * **不是**放行条件——放行要看暗号验证（`telegram_confirm_owner`）。
+   * 主人的 Telegram 数字 ID（可多个）。用途是「通知收件地址与审批人身份」。
    */
   ownerUserIds: number[];
-  /** 面板里填的单个主人 ID（`ownerUserIds` 为空时用它）。 */
+  /** 面板里填的单个主人 ID（ownerUserIds 为空时用它）。 */
   ownerUserId: number;
   /**
    * 白名单**私聊真人**要求发送「文件 / 图片 / 个人材料」时的策略。
    * uto 直接发、sk 先问主人、deny 一律拒绝。
-   * 群 / 频道 / TG bot 账号不受此项影响——那些会话只能交流与发表情。
+   * 群 / 频道 / TG bot 账号不受此项影响——那些会话只能交流、发表情、发语音与翻唱。
    */
   fileByWhitelisted: GuardPolicy;
   /** 审批码有效期（分钟）。 */

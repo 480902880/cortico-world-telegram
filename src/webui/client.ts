@@ -35,9 +35,11 @@ const STEP_TEXT: Record<string, string> = {
 const CONN_TEXT: Record<string, string> = {
   offline: '未连接',
   connecting: '连接中',
+  reconnecting: '重连中',
   online: '已连接',
   error: '连接错误',
   revoked: '授权失效',
+  banned: '账号受限',
 };
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -114,7 +116,7 @@ function installButtonFeedback(root: HTMLElement, bar: HTMLElement): () => void 
 
   const onClick = (event: Event): void => {
     const button = (event.target as HTMLElement | null)?.closest('button');
-    if (!button || button.disabled || pending.has(button)) return;
+    if (!button || button.disabled || pending.has(button) || button.dataset.noFeedback === '1') return;
     button.dataset.feedbackLabel = button.textContent ?? '';
     button.textContent = `${button.dataset.feedbackLabel}…`;
     button.style.opacity = '0.55';
@@ -206,7 +208,7 @@ function depsCard(ctx: WebUiPanelContext): HTMLElement {
     ready: boolean;
     installing: boolean;
     dir?: string;
-    manager?: string;
+    manager?: string | null;
     managerProblem?: string;
   }): void => {
     if (status.dir) pathLine.textContent = `包目录：${status.dir}`;
@@ -274,6 +276,9 @@ function depsCard(ctx: WebUiPanelContext): HTMLElement {
         hasDist: boolean;
         ready: boolean;
         installing: boolean;
+        dir?: string;
+        manager?: string | null;
+        managerProblem?: string;
       }>('deps_status');
       if (!status) return;
       paint(status);
@@ -284,6 +289,8 @@ function depsCard(ctx: WebUiPanelContext): HTMLElement {
     }
   };
 
+  installBtn.dataset.noFeedback = '1';
+  refreshBtn.dataset.noFeedback = '1';
   installBtn.onclick = async (): Promise<void> => {
     try {
       const res = await ctx.invoke<{ started: boolean }>('install_deps');
@@ -320,40 +327,59 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
       ctx.signal.addEventListener('abort', stopFeedback);
 
       let currentStep = '';
-      let busy = false;
+      let actionBusy = false;
+      let pollBusy = false;
+      /** 最近一次主动操作给出的提示（5 秒内不被后台轮询覆盖）。 */
+      let stickyNoticeUntil = 0;
       /** 原样记住用户填的手机号：重发验证码不能用掩码串（+86 138****8000 会被拒）。 */
       let lastPhone = '';
 
-      const say = (text: string, tone: 'info' | 'error' = 'info'): void => {
+      const say = (text: string, tone: 'info' | 'error' = 'info', stickyMs = 0): void => {
         bar.textContent = text;
         bar.style.color = tone === 'error' ? '#e2564a' : 'inherit';
+        if (stickyMs > 0) stickyNoticeUntil = Date.now() + stickyMs;
       };
 
-      const call = async (method: string, args: unknown[] = []): Promise<PanelStatus | null> => {
-        if (busy) return null;
-        busy = true;
+      const call = async (method: string, args: unknown[] = []): Promise<any | null> => {
+        if (actionBusy) return null;
+        actionBusy = true;
         try {
-          const result = await ctx.invoke<PanelStatus>(method, args);
+          const result = await ctx.invoke<any>(method, args);
+          if (result && typeof result === 'object' && typeof result.message === 'string' && result.message) {
+            say(result.message, 'info', 5000);
+          }
           return result ?? null;
         } catch (error) {
-          say(error instanceof Error ? error.message : String(error), 'error');
+          say(error instanceof Error ? error.message : String(error), 'error', 6000);
           return null;
         } finally {
-          busy = false;
+          actionBusy = false;
         }
       };
 
-      const refresh = async (): Promise<void> => {
-        const status = await call('status');
-        if (!status) return;
-        const auth = status.auth;
-        const where = CONN_TEXT[status.connection.status] ?? status.connection.status;
-        const who = auth.account
-          ? `${auth.account.firstName ?? ''}${auth.account.lastName ? ` ${auth.account.lastName}` : ''}`
-            + `${auth.account.username ? ` @${auth.account.username}` : ''} (${auth.account.id})`
-          : '未登录';
-        say(`${where} · ${STEP_TEXT[auth.step] ?? auth.step}${auth.detail ? ` · ${auth.detail}` : ''} · ${who}`);
-        renderStep(status);
+      const refresh = async (fromPoll = false): Promise<void> => {
+        if (pollBusy || (fromPoll && actionBusy)) return;
+        pollBusy = true;
+        try {
+          const status = await ctx.invoke<PanelStatus>('status');
+          if (!status) return;
+          const auth = status.auth;
+          const where = CONN_TEXT[status.connection.status] ?? status.connection.status;
+          const who = auth.account
+            ? `${auth.account.firstName ?? ''}${auth.account.lastName ? ` ${auth.account.lastName}` : ''}`
+              + `${auth.account.username ? ` @${auth.account.username}` : ''} (${auth.account.id})`
+            : '未登录';
+          // 后台轮询不要覆盖刚刚产生的报错/保存提示，也不要无故触发 MutationObserver
+          const summary = `${where} · ${STEP_TEXT[auth.step] ?? auth.step}${auth.detail ? ` · ${auth.detail}` : ''} · ${who}`;
+          if (!fromPoll || (Date.now() >= stickyNoticeUntil && bar.textContent !== summary)) {
+            say(summary);
+          }
+          renderStep(status);
+        } catch (error) {
+          if (!fromPoll) say(error instanceof Error ? error.message : String(error), 'error', 5000);
+        } finally {
+          pollBusy = false;
+        }
       };
 
       const renderStep = (status: PanelStatus): void => {
@@ -362,13 +388,18 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         if (step === currentStep) {
           const hint = body.querySelector('[data-role=restart-hint]') as HTMLElement | null;
           if (hint) hint.style.display = status.needsRestart ? 'block' : 'none';
+          // 若用户在「会话」页改了白名单且当前没在编辑文本框，同步最新白名单到输入框
+          const uBox = body.querySelector('[data-role=allow-users]') as HTMLTextAreaElement | null;
+          const cBox = body.querySelector('[data-role=allow-chats]') as HTMLTextAreaElement | null;
+          if (uBox && document.activeElement !== uBox) uBox.value = status.allow.users.join(', ');
+          if (cBox && document.activeElement !== cBox) cBox.value = status.allow.chats.join(', ');
           return;
         }
         currentStep = step;
         body.replaceChildren();
 
         if (step === 'authorized') {
-          body.append(...authorizedSection(status, ctx, call, refresh));
+          body.append(...authorizedSection(status, ctx, call, () => refresh(false)));
           return;
         }
 
@@ -395,11 +426,11 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
           const again = el('button', BUTTON, '重新发送');
           again.onclick = async () => {
             if (!lastPhone) {
-              say('无法重发：请回到上一步重新填写手机号', 'error');
+              say('无法重发：请回到上一步重新填写手机号', 'error', 5000);
               return;
             }
-            await call('start_login', [lastPhone]);
-            await refresh();
+            const next = await call('start_login', [lastPhone]);
+            if (next) await refresh();
           };
           const card = el('div', CARD);
           card.append(title('输入验证码'), labeled('验证码', code), el('div', { display: 'flex', gap: '8px' }, undefined));
@@ -418,14 +449,6 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         };
         const card = el('div', CARD);
         card.append(title('用个人账号登录'), labeled('手机号（带国家码）', phone), send);
-        // 代理网络下拿不到验证码，多半是流量没被接管：提示开 TUN
-        card.append(
-          el(
-            'div',
-            { ...LABEL, opacity: '0.55' },
-            '用代理上网的话，要在代理软件里打开「TUN / 虚拟网卡模式」，否则收不到验证码（会提示连不上服务器）。',
-          ),
-        );
         if (step === 'revoked') {
           card.append(el('div', { ...LABEL, color: '#e2564a' }, '上一次的会话已被其他设备终止，需要重新登录。'));
         }
@@ -435,7 +458,7 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
       const authorizedSection = (
         status: PanelStatus,
         panelCtx: WebUiPanelContext,
-        invoke: (m: string, a?: unknown[]) => Promise<PanelStatus | null>,
+        invoke: (m: string, a?: unknown[]) => Promise<any | null>,
         reload: () => Promise<void>,
       ): HTMLElement[] => {
         const account = el('div', CARD);
@@ -455,9 +478,12 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
 
         const logout = el('button', BUTTON, '登出（只注销本扩展这条授权）');
         logout.onclick = async () => {
-          if (!window.confirm('登出后需要重新输入验证码；电脑版和手机版的登录不受影响。继续？')) return;
-          await invoke('logout');
-          await reload();
+          if (!window.confirm('登出后需要重新输入验证码；电脑版和手机版的登录不受影响。继续？')) {
+            say('已取消登出');
+            return;
+          }
+          const ok = await invoke('logout');
+          if (ok) await reload();
         };
         account.append(logout);
 
@@ -466,13 +492,13 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         const apiHash = field('api_hash', { placeholder: status.credentials.apiHashMasked || '32 位十六进制' });
         const saveCred = el('button', BUTTON, '保存凭据');
         saveCred.onclick = async () => {
-          await invoke('set_credentials', [apiId.value, apiHash.value]);
-          await reload();
+          const res = await invoke('set_credentials', [apiId.value, apiHash.value]);
+          if (res) await refresh(true);
         };
         const restart = el('button', BUTTON, '重启 World');
         restart.onclick = async () => {
-          await invoke('restart');
-          await reload();
+          const res = await invoke('restart');
+          if (res) await refresh(true);
         };
         const hint = el('div', { ...LABEL, display: status.needsRestart ? 'block' : 'none' }, '凭据已保存，重启 World 后生效。');
         hint.dataset.role = 'restart-hint';
@@ -483,7 +509,7 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
             ? [el('div', { ...LABEL, opacity: '0.55' }, '内置凭据是公共的，可能被限流。想更稳就去 my.telegram.org 申请一份填在下面（免费，两分钟）。')]
             : []),
           labeled('api_id', apiId),
-          labeled('api_hash（留空=不改）', apiHash),
+          labeled('api_hash（与 api_id 成对填写）', apiHash),
           el('div', { display: 'flex', gap: '8px' }, undefined),
         );
         (cred.lastElementChild as HTMLElement).append(saveCred, restart);
@@ -491,13 +517,15 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
 
         const allow = el('div', CARD);
         const users = el('textarea', { ...INPUT, minHeight: '54px' });
+        users.dataset.role = 'allow-users';
         users.value = status.allow.users.join(', ');
         const chats = el('textarea', { ...INPUT, minHeight: '54px' });
+        chats.dataset.role = 'allow-chats';
         chats.value = status.allow.chats.join(', ');
         const saveAllow = el('button', BUTTON, '保存白名单');
         saveAllow.onclick = async () => {
-          await invoke('set_allowlist', [users.value, chats.value]);
-          await reload();
+          const res = await invoke('set_allowlist', [users.value, chats.value]);
+          if (res) await refresh(true);
         };
         allow.append(
           title('谁能唤醒 Bot'),
@@ -510,8 +538,8 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         return [account, cred, allow];
       };
 
-      void refresh();
-      ctx.interval(() => { void refresh(); }, 2500);
+      void refresh(false);
+      ctx.interval(() => { void refresh(true); }, 2500);
     },
   };
 }
@@ -588,6 +616,7 @@ function chatsPanel(): { mount(ctx: WebUiPanelContext): void } {
       limitInput.style.width = '88px';
       const reloadBtn = el('button', BUTTON, '重新读');
       const closeBtn = el('button', BUTTON, '关闭');
+      closeBtn.dataset.noFeedback = '1';
       drawerHead.append(drawerTitle, el('span', LABEL, '条数'), limitInput, reloadBtn, closeBtn);
       const drawerList = el('div', {
         display: 'grid',
@@ -638,9 +667,12 @@ function chatsPanel(): { mount(ctx: WebUiPanelContext): void } {
             d.chat.kind,
             wanted,
           ]);
+          // 防止快切会话时旧请求晚到覆盖新会话历史
+          if (openChat !== d.chat.id) return;
           renderMessages(res?.messages ?? []);
           say(`${d.chat.title || d.chat.id}：读到 ${res?.messages?.length ?? 0} 条`);
         } catch (error) {
+          if (openChat !== d.chat.id) return;
           drawerList.replaceChildren(el('div', { ...LABEL, color: '#e2564a' }, error instanceof Error ? error.message : String(error)));
           say(error instanceof Error ? error.message : String(error), 'error');
         }
@@ -868,7 +900,7 @@ function resourcesPanel(): { mount(ctx: WebUiPanelContext): void } {
         }
       };
 
-      const load = async (): Promise<void> => {
+      const load = async (silent = false): Promise<void> => {
         try {
           const res = await ctx.invoke<{ dirs: ResourceDirView[] }>('resources_status');
           const dirs = res?.dirs ?? [];
@@ -882,8 +914,10 @@ function resourcesPanel(): { mount(ctx: WebUiPanelContext): void } {
               paint(dir);
             }
           }
-          const configured = dirs.filter((d) => d.configured && d.exists).length;
-          say(`${dirs.length} 个目录槽位，已配置 ${configured} 个。改完点「保存全部」。`);
+          if (!silent) {
+            const configured = dirs.filter((d) => d.configured && d.exists).length;
+            say(`${dirs.length} 个目录槽位，已配置 ${configured} 个。改完点「保存全部」。`);
+          }
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         }
@@ -895,8 +929,8 @@ function resourcesPanel(): { mount(ctx: WebUiPanelContext): void } {
         saveBtn.disabled = true;
         try {
           const res = await ctx.invoke<{ message: string }>('set_resources', [payload]);
+          await load(true);
           say(res?.message ?? '已保存');
-          await load();
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         } finally {
@@ -944,7 +978,10 @@ function resourcesPanel(): { mount(ctx: WebUiPanelContext): void } {
       };
 
       cleanAll.onclick = async (): Promise<void> => {
-        if (!window.confirm('把下载缓存全部删掉？（不会动你配置的素材目录）')) return;
+        if (!window.confirm('把下载缓存全部删掉？（不会动你配置的素材目录）')) {
+          say('已取消清空');
+          return;
+        }
         try {
           const r = await ctx.invoke<{ removed: number; freedBytes: number }>('cleanup_cache', [{ all: true }]);
           say(`已清空：删 ${r.removed} 个，释放 ${human(r.freedBytes)}`);
@@ -974,10 +1011,6 @@ function stickersPanel(): { mount(ctx: WebUiPanelContext): void } {
         bar.style.color = tone === 'error' ? '#e2564a' : 'inherit';
       };
 
-      const human = (bytes: number): string => (bytes >= 1024 * 1024
-        ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
-        : `${Math.round(bytes / 1024)} KB`);
-
       const localCard = el('div', CARD);
       const localList = el('div', { display: 'grid', gap: '4px', marginTop: '6px' });
       localCard.append(
@@ -1000,7 +1033,7 @@ function stickersPanel(): { mount(ctx: WebUiPanelContext): void } {
 
       body.append(localCard, tgCard);
 
-      const load = async (): Promise<void> => {
+      const load = async (silent = false): Promise<void> => {
         try {
           const data = await ctx.invoke<{
             local: {
@@ -1051,7 +1084,7 @@ function stickersPanel(): { mount(ctx: WebUiPanelContext): void } {
               tgList.append(row);
             }
           }
-          say(`本地 ${data.local.total} 个 · 已装 ${data.installed.length} 包 · 收藏 ${data.faved} 个`);
+          if (!silent) say(`本地 ${data.local.total} 个 · 已装 ${data.installed.length} 包 · 收藏 ${data.faved} 个`);
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         }
@@ -1065,9 +1098,9 @@ function stickersPanel(): { mount(ctx: WebUiPanelContext): void } {
         }
         try {
           const res = await ctx.invoke<{ message: string }>('install_sticker_set', [shortName, install]);
-          say(res?.message ?? '完成');
           tgInput.value = '';
-          await load();
+          await load(true);
+          say(res?.message ?? '完成');
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         }
@@ -1142,6 +1175,7 @@ function behaviorPanel(): { mount(ctx: WebUiPanelContext): void } {
               input.value = String(values[field.key] ?? 0);
               input.style.width = '140px';
               head.append(input, el('span', LABEL, field.unit ?? ''));
+              collectors.set(field.key, () => input.value.trim());
             } else {
               const select = el('select', { ...INPUT, width: '180px' });
               for (const option of field.options ?? []) {
@@ -1162,11 +1196,11 @@ function behaviorPanel(): { mount(ctx: WebUiPanelContext): void } {
         }
       };
 
-      const load = async (): Promise<void> => {
+      const load = async (silent = false): Promise<void> => {
         try {
           const data = await ctx.invoke<{ fields: SettingFieldView[]; values: Record<string, unknown> }>('behavior_fields');
           build(data.fields ?? [], data.values ?? {});
-          say(`${data.fields?.length ?? 0} 项设置，改完点「保存」。`);
+          if (!silent) say(`${data.fields?.length ?? 0} 项设置，改完点「保存」。`);
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         }
@@ -1178,8 +1212,8 @@ function behaviorPanel(): { mount(ctx: WebUiPanelContext): void } {
         saveBtn.disabled = true;
         try {
           const res = await ctx.invoke<{ message: string; values: Record<string, unknown> }>('save_behavior', [patch]);
+          await load(true);
           say(res?.message ?? '已保存');
-          await load();
         } catch (error) {
           say(error instanceof Error ? error.message : String(error), 'error');
         } finally {
@@ -1199,18 +1233,19 @@ function statusPanel(): { mount(ctx: WebUiPanelContext): void } {
       const card = el('div', CARD);
       const bar = statusBar();
       ctx.root.append(bar, card);
-      const stopFeedback = installButtonFeedback(ctx.root, bar);
-      ctx.signal.addEventListener('abort', stopFeedback);
 
       const refresh = async (): Promise<void> => {
         try {
           const s = await ctx.invoke<PanelStatus>('status');
           if (!s) return;
-          bar.textContent = `${CONN_TEXT[s.connection.status] ?? s.connection.status} · ${STEP_TEXT[s.auth.step] ?? s.auth.step}`;
+          const connLabel = CONN_TEXT[s.connection.status] ?? s.connection.status;
+          const authLabel = STEP_TEXT[s.auth.step] ?? s.auth.step;
+          bar.textContent = `${connLabel} · ${authLabel}`;
+          bar.style.color = 'inherit';
           card.replaceChildren(
             title('Telegram'),
-            row('连接', `${s.connection.status}${s.connection.detail ? ` · ${s.connection.detail}` : ''}`),
-            row('登录', `${s.auth.step}${s.auth.detail ? ` · ${s.auth.detail}` : ''}`),
+            row('连接', `${connLabel}${s.connection.detail ? ` · ${s.connection.detail}` : ''}`),
+            row('登录', `${authLabel}${s.auth.detail ? ` · ${s.auth.detail}` : ''}`),
             row('账号', s.auth.account ? `${s.auth.account.id}${s.auth.account.username ? ` @${s.auth.account.username}` : ''}` : '—'),
             row('api_id', `${s.credentials.apiId} · ${s.credentials.label}`),
             row('api_hash', s.credentials.apiHashMasked || '—'),
@@ -1225,6 +1260,7 @@ function statusPanel(): { mount(ctx: WebUiPanelContext): void } {
           );
         } catch (error) {
           bar.textContent = error instanceof Error ? error.message : String(error);
+          bar.style.color = '#e2564a';
         }
       };
 

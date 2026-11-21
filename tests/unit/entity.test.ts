@@ -3,7 +3,7 @@
  * 跑法：npx tsx tests/unit/entity.test.ts
  */
 
-import { mapEntity } from '../../src/mtproto/client.ts';
+import { mapEntity, mentionsUser, peerIdOf } from '../../src/mtproto/client.ts';
 
 let passed = 0;
 let failed = 0;
@@ -38,6 +38,16 @@ console.log('\n# 异常输入');
 eq('没有 id → null', mapEntity({ className: 'User' }), null);
 eq('未知类型 → null', mapEntity({ className: 'Message', id: 1 }), null);
 eq('空对象 → null', mapEntity({}), null);
+
+console.log('\n# peerIdOf 区分超级群与广播频道');
+eq('PeerChannel 带 megagroup 实体 → group', peerIdOf({ peerId: { className: 'PeerChannel' }, chatId: -100123, chat: { className: 'Channel', megagroup: true } }).kind, 'group');
+eq('PeerChannel 无 post 但有 fromId → group', peerIdOf({ peerId: { className: 'PeerChannel' }, chatId: -100123, fromId: { className: 'PeerUser', userId: 7 } }).kind, 'group');
+eq('PeerChannel 带 post=true → channel', peerIdOf({ peerId: { className: 'PeerChannel' }, chatId: -100123, post: true }).kind, 'channel');
+
+console.log('\n# mentionsUser 词边界匹配');
+eq('精确 @alice 命中', mentionsUser({ message: 'hi @alice!' }, 1, 'alice'), true);
+eq('@alice_bot 不误命中 @alice', mentionsUser({ message: 'hi @alice_bot' }, 1, 'alice'), false);
+eq('邮箱 foo@alice.com 不误命中', mentionsUser({ message: 'mail foo@alice.com' }, 1, 'alice'), false);
 
 console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
 if (failed > 0) process.exitCode = 1;

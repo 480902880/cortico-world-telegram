@@ -126,6 +126,14 @@ console.log('\n# 主人用大白话回复');
   eq('空串', classifyOwnerReply('   '), null);
   eq('长句不误判', classifyOwnerReply('我觉得这个可以但是要不等明天再说吧'), null);
   eq('英文也行', classifyOwnerReply('sure'), 'allow');
+  // 否定词与日常用语回归（保留自然语言审批，避免把否定或问候误判成同意）
+  eq('「不好」→ deny', classifyOwnerReply('不好'), 'deny');
+  eq('「不能发」→ deny', classifyOwnerReply('不能发'), 'deny');
+  eq('「你好」→ 普通聊天', classifyOwnerReply('你好'), null);
+  eq('「早上好」→ 普通聊天', classifyOwnerReply('早上好'), null);
+  eq('「出发」→ 普通聊天', classifyOwnerReply('出发'), null);
+  eq('「book」→ 不误命中 ok', classifyOwnerReply('book'), null);
+  eq('「know」→ 不误命中 no', classifyOwnerReply('know'), null);
 }
 
 console.log(`\n结果：${passed} 通过 / ${failed} 失败`);

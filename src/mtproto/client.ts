@@ -8,7 +8,7 @@
  * 其余方法按阶段抛 `UnsupportedError`，绝不返回假成功。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync } from 'node:fs';
 import { basename, extname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -18,7 +18,8 @@ import { ensureVoiceOgg } from '../media/voice.ts';
 import { FLOOD_RETRY_MAX_SECONDS, RateLimiter, floodWaitSeconds } from './ratelimit.ts';
 import { parseReactionUpdate } from './reactions.ts';
 import { reactionSummary } from './message-reactions.ts';
-import { Api, NewMessageEvent, StringSession, TelegramClient, forumTopics, utilsApi } from './lib.ts';
+import { Api, NewMessageEvent, StringSession, TelegramClient, forumTopics, networkExports, utilsApi } from './lib.ts';
+import { buildAutoProxyTransport, clearSystemProxyCache } from './proxy.ts';
 import { SentTracker } from './sent-tracker.ts';
 import type { Credentials } from './credentials.ts';
 import {
@@ -95,20 +96,6 @@ function nowMs(): number {
   return Date.now();
 }
 
-function parseProxy(raw: string | undefined): Record<string, unknown> | undefined {
-  const s = (raw ?? '').trim();
-  if (!s) return undefined;
-  if (s.startsWith('socks5://') || s.startsWith('socks://')) {
-    const u = new URL(s.replace('socks://', 'socks5://'));
-    const port = Number(u.port || 1080);
-    const out: Record<string, unknown> = { ip: u.hostname, port, socksType: 5 };
-    if (u.username) out.username = decodeURIComponent(u.username);
-    if (u.password) out.password = decodeURIComponent(u.password);
-    return out;
-  }
-  throw new Error(`代理格式暂不支持：${s}（P0 只支持 socks5://host:port）`);
-}
-
 export class MtprotoClient implements MtprotoPort {
   private client: any = null;
   private conn: ConnectionState = { status: 'offline', since: nowMs() };
@@ -118,8 +105,13 @@ export class MtprotoClient implements MtprotoPort {
   private everOnline = false;
   private readonly log: ClientLogger;
   private readonly disposers: Array<() => void> = [];
+  private readonly holdTimers = new Set<ReturnType<typeof setTimeout>>();
   /** randomId → 等待 messageId 的 resolver（发送返回值里没带 id 时用）。 */
   private readonly idWaiters = new Map<string, (id: number) => void>();
+  /** 已知会话类型缓存（用于区分 PeerChannel 是超级群还是广播频道）。 */
+  private readonly chatKindCache = new Map<number, ChatKind>();
+  /** 当前使用的 StringSession（登出/失效重登时会置空，避免复用到启动时的旧 session）。 */
+  private sessionString: string | null;
   private revoked = false;
   /** 自己的账号 id / 用户名（登录后填，判定 @ 用）。 */
   private selfId = 0;
@@ -128,6 +120,35 @@ export class MtprotoClient implements MtprotoPort {
   constructor(private readonly opts: MtprotoClientOptions) {
     this.log = opts.log ?? NOOP_LOG;
     this.limiter = new RateLimiter(opts.rateLimit ?? {});
+    this.sessionString = opts.session;
+  }
+
+  private rememberChatKind(id: number, kind: ChatKind): void {
+    if (!Number.isFinite(id) || id === 0) return;
+    this.chatKindCache.set(id, kind);
+    while (this.chatKindCache.size > 2000) {
+      const oldest = this.chatKindCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.chatKindCache.delete(oldest);
+    }
+  }
+
+  /** 结合 chatKindCache 与实体属性修正 PeerChannel（区分超级群与广播频道）。 */
+  private resolveChatKind(raw: any, peerId: number, fallback: ChatKind, entity?: any): ChatKind {
+    const chat = entity ?? raw?.chat;
+    if (chat?.className === 'Channel') {
+      const kind: ChatKind = chat.megagroup === true ? 'group' : 'channel';
+      this.rememberChatKind(peerId, kind);
+      return kind;
+    }
+    const cached = this.chatKindCache.get(peerId);
+    if (cached) return cached;
+    if (fallback === 'channel' && raw && typeof raw === 'object') {
+      if (raw.post === true) return 'channel';
+      // 超级群普通消息不带 post=true 且有发言人（fromId / senderId）
+      if (raw.fromId || raw.senderId !== undefined) return 'group';
+    }
+    return fallback;
   }
 
   // ── 连接 ──────────────────────────────────────────────
@@ -144,9 +165,13 @@ export class MtprotoClient implements MtprotoPort {
 
   private ensureClient(): any {
     if (this.client) return this.client;
-    const { credentials, session, transport } = this.opts;
-    this.client = new TelegramClient(
-      new StringSession(session ?? ''),
+    const { credentials, transport } = this.opts;
+    const autoTransport = buildAutoProxyTransport(networkExports(), {
+      explicitProxy: transport?.proxy,
+      log: this.log,
+    });
+    const client = new TelegramClient(
+      new StringSession(this.sessionString ?? ''),
       credentials.apiId,
       credentials.apiHash,
       {
@@ -158,14 +183,98 @@ export class MtprotoClient implements MtprotoPort {
         appVersion: this.opts.appVersion ?? '0.2.0',
         langCode: 'zh',
         systemLangCode: 'zh-CN',
-        ...(parseProxy(transport?.proxy) ? { proxy: parseProxy(transport?.proxy) } : {}),
+        transport: autoTransport,
       },
     );
+    this.client = client;
+    this.bindClientLifecycle(client);
+    // 登出/失效后原地重新登录时，自动把上层注册过的更新处理器重新挂到新 client 上
+    if (this.handlers) {
+      this.bindUpdateHandlers(client);
+    }
     return this.client;
+  }
+
+  private bindClientLifecycle(client: any): void {
+    const sub = (method: string, fn: () => void): void => {
+      if (typeof client[method] !== 'function') return;
+      try {
+        const unsub = client[method](fn);
+        if (typeof unsub === 'function') this.disposers.push(unsub);
+      } catch {
+        // 忽略：旧版/mock client 可能不支持生命周期钩子
+      }
+    };
+    sub('onDisconnect', () => {
+      if (this.client !== client || this.revoked) return;
+      if (this.conn.status === 'online') this.setState('reconnecting');
+    });
+    sub('onReconnecting', () => {
+      if (this.client !== client || this.revoked) return;
+      this.setState('reconnecting');
+    });
+    sub('onReconnect', () => {
+      if (this.client !== client || this.revoked) return;
+      this.setState('online');
+      this.everOnline = true;
+      try {
+        this.opts.onReconnect?.();
+      } catch (error) {
+        this.log.warn('onReconnect 回调失败', { reason: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  }
+
+  private async teardownClient(keepHandlers: boolean): Promise<void> {
+    for (const dispose of this.disposers.splice(0)) {
+      try {
+        dispose();
+      } catch {
+        // 忽略：句柄可能已随连接释放
+      }
+    }
+    for (const timer of this.holdTimers) clearTimeout(timer);
+    this.holdTimers.clear();
+    for (const resolve of this.idWaiters.values()) {
+      try {
+        resolve(0);
+      } catch {
+        // 忽略
+      }
+    }
+    this.idWaiters.clear();
+    if (!keepHandlers) this.handlers = null;
+
+    const current = this.client;
+    this.client = null;
+    if (current) {
+      try {
+        if (typeof current.destroy === 'function') await current.destroy();
+        else await current.disconnect?.();
+      } catch {
+        // 断开失败不影响本地状态
+      }
+    }
+    this.dialogsCache = undefined;
+    this.gifCache.clear();
+    this.selfId = 0;
+    this.selfUsername = undefined;
+    this.everOnline = false;
+  }
+
+  /** 重新登录前清空失效/旧 session 状态，允许原地重登而无需重启整个 World。 */
+  async prepareLogin(): Promise<void> {
+    this.revoked = false;
+    this.sessionString = null;
+    this.tracker.reset();
+    await this.teardownClient(true);
+    this.setState('offline');
   }
 
   async connect(): Promise<void> {
     if (this.revoked) throw new Error('会话已被其他设备终止，请重新登录');
+    // 每次主动建连前清掉系统代理短缓存，确保刚开关系统代理就能立刻生效
+    clearSystemProxyCache();
     const client = this.ensureClient();
     const wasOnline = this.conn.status === 'online';
     this.setState('connecting');
@@ -183,10 +292,9 @@ export class MtprotoClient implements MtprotoPort {
       this.everOnline = true;
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
-      // 连不上 DC 时给一句能照做的话：多半是网络到不了 Telegram，需要代理
-      const friendly = /timed out|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ECONNRESET|TLS/i.test(raw)
-        ? `连不上 Telegram 服务器（${raw.slice(0, 120)}）。这个网络多半访问不了 Telegram：`
-          + '去「行为 → 网络」填一个 socks5 代理（例 socks5://127.0.0.1:1080），保存后重启 Coo。'
+      // 连不上 DC 时给一句能照做的话：已自动探测系统代理，多半是代理软件没开或端口不可用
+      const friendly = /timed out|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ECONNRESET|TLS|HTTP proxy|SOCKS/i.test(raw)
+        ? `连不上 Telegram 服务器（${raw.slice(0, 120)}）。插件会自动读取系统代理与环境变量，请确认代理软件已运行并开启「系统代理」（或 TUN 模式）后重试。`
         : raw;
       this.setState('error', friendly);
       throw error;
@@ -194,20 +302,7 @@ export class MtprotoClient implements MtprotoPort {
   }
 
   async disconnect(): Promise<void> {
-    for (const dispose of this.disposers.splice(0)) {
-      try {
-        dispose();
-      } catch {
-        // 忽略：句柄可能已随连接释放
-      }
-    }
-    this.handlers = null;
-    try {
-      await this.client?.disconnect();
-    } catch {
-      // 断开失败不影响本地状态
-    }
-    this.client = null;
+    await this.teardownClient(false);
     this.setState('offline');
   }
 
@@ -226,9 +321,12 @@ export class MtprotoClient implements MtprotoPort {
   private markRevoked(detail: string): void {
     if (this.revoked) return;
     this.revoked = true;
+    this.sessionString = null;
     const info = classifyFatal(detail);
     this.setState(info?.kind === 'banned' ? 'banned' : 'revoked', info?.human ?? detail);
     this.tracker.reset();
+    // 立即销毁底层 client，停止后台自动重连风暴；保留 handlers 以便用户原地重新登录
+    void this.teardownClient(true);
     this.opts.onRevoked?.(info?.human ?? detail);
   }
 
@@ -246,22 +344,26 @@ export class MtprotoClient implements MtprotoPort {
     return this.peerFloodUntil > Date.now() ? this.peerFloodUntil : 0;
   }
 
+  private handleRpcError(error: unknown): never | void {
+    const message = error instanceof Error ? error.message : String(error);
+    if (this.isRevokedError(error)) {
+      this.markRevoked(message);
+      throw error;
+    }
+    const flood = classifyFatal(message);
+    if (flood?.kind === 'peer-flood') {
+      this.peerFloodUntil = Date.now() + PEER_FLOOD_PAUSE_MS;
+      this.log.warn('遇到 PEER_FLOOD，暂停主动联系陌生人 24 小时', { until: this.peerFloodUntil });
+      throw new Error(`[limited] ${flood.human}`);
+    }
+  }
+
   private async guard<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (error) {
+      this.handleRpcError(error);
       const message = error instanceof Error ? error.message : String(error);
-      if (this.isRevokedError(error)) {
-        this.markRevoked(message);
-        throw error;
-      }
-      // PEER_FLOOD：不重试，记下罚站时间，让上层对陌生人静默
-      const flood = classifyFatal(message);
-      if (flood?.kind === 'peer-flood') {
-        this.peerFloodUntil = Date.now() + PEER_FLOOD_PAUSE_MS;
-        this.log.warn('遇到 PEER_FLOOD，暂停主动联系陌生人 24 小时', { until: this.peerFloodUntil });
-        throw new Error(`[limited] ${flood.human}`);
-      }
       const wait = floodWaitSeconds(message);
       if (wait === null) throw error;
       if (wait > FLOOD_RETRY_MAX_SECONDS) {
@@ -269,7 +371,12 @@ export class MtprotoClient implements MtprotoPort {
       }
       this.log.warn('遇到 FloodWait，等一次再重试', { seconds: wait });
       await new Promise((resolve) => setTimeout(resolve, (wait + 1) * 1000));
-      return await fn();
+      try {
+        return await fn();
+      } catch (retryError) {
+        this.handleRpcError(retryError);
+        throw retryError;
+      }
     }
   }
 
@@ -325,7 +432,9 @@ export class MtprotoClient implements MtprotoPort {
 
   saveSession(): string {
     const session = this.client?.session;
-    return typeof session?.save === 'function' ? String(session.save()) : '';
+    const saved = typeof session?.save === 'function' ? String(session.save()) : '';
+    if (saved) this.sessionString = saved;
+    return saved;
   }
 
   /**
@@ -340,16 +449,17 @@ export class MtprotoClient implements MtprotoPort {
         this.log.warn('auth.logOut 未成功', { reason: error instanceof Error ? error.message : String(error) });
       }
     }
+    this.revoked = false;
+    this.sessionString = null;
     this.tracker.reset();
-    await this.disconnect();
+    // 保留已注册的 handlers，允许用户不重启直接原地重新登录
+    await this.teardownClient(true);
+    this.setState('offline');
   }
 
   // ── 更新桥 ────────────────────────────────────────────
 
-  onUpdates(handlers: UpdateHandlers): () => void {
-    const client = this.ensureClient();
-    this.handlers = handlers;
-
+  private bindUpdateHandlers(client: any): void {
     const onMessage = (event: any): void => this.handleIncoming(event);
     client.addEventHandler(onMessage, new NewMessageEvent({}));
     this.disposers.push(() => client.removeEventHandler?.(onMessage, new NewMessageEvent({})));
@@ -369,9 +479,11 @@ export class MtprotoClient implements MtprotoPort {
       // 编辑：对方改了内容，走的是 UpdateEditMessage，不是新消息
       if (update?.className === 'UpdateEditMessage' || update?.className === 'UpdateEditChannelMessage') {
         try {
-          const edited = toMsg(update.message);
-          (edited as { edited?: boolean }).edited = true;
-          this.handlers?.onEditMessage?.(edited);
+          const rawMsg = update.message;
+          const edited = toMsg(rawMsg);
+          const resolvedKind = this.resolveChatKind(rawMsg, edited.chatId, edited.chatKind);
+          const finalMsg: Msg = { ...edited, chatKind: resolvedKind, edited: true };
+          this.handlers?.onEditMessage?.(finalMsg);
         } catch (error) {
           this.log.debug('编辑消息解析失败（忽略）', { reason: error instanceof Error ? error.message : String(error) });
         }
@@ -388,7 +500,8 @@ export class MtprotoClient implements MtprotoPort {
             ?? (update.channelId ? { className: 'PeerChannel', channelId: update.channelId } : undefined);
           const { id, kind } = peerIdOf({ peerId: peer });
           if (!id) return;
-          this.handlers?.onDelete?.({ id, kind }, ids);
+          const resolvedKind = this.resolveChatKind(undefined, id, kind);
+          this.handlers?.onDelete?.({ id, kind: resolvedKind }, ids);
         } catch (error) {
           this.log.debug('删除更新解析失败（忽略）', { reason: error instanceof Error ? error.message : String(error) });
         }
@@ -399,6 +512,16 @@ export class MtprotoClient implements MtprotoPort {
     // `Cannot read properties of undefined (reading 'func')`，所以这里用官方文档里的无参形式。
     client.addEventHandler(onRaw);
     this.disposers.push(() => client.removeEventHandler?.(onRaw));
+  }
+
+  onUpdates(handlers: UpdateHandlers): () => void {
+    const hadClient = Boolean(this.client);
+    this.handlers = handlers;
+    const client = this.ensureClient();
+    // 若 client 此前已存在，则需立即挂上句柄；若是本次 ensureClient 新建的，ensureClient 内部已挂过
+    if (hadClient) {
+      this.bindUpdateHandlers(client);
+    }
 
     return () => {
       this.handlers = null;
@@ -422,20 +545,14 @@ export class MtprotoClient implements MtprotoPort {
     this.log.debug('收到 updateMessageID', { messageId, claimed });
   }
 
-  /**
-   * 解析反应变化。
-   *
-   * 两个来源：
-   *  - `UpdateMessageReactions`：某条消息的反应集合变了（对方点了/取消了）
-   *  - `UpdateBotMessageReaction`：只发给 bot 账号，普通账号收不到
-   *
-   * 字段都很"可选"，这里一律降级处理，解析失败就当没收到——不能让反应把消息处理搞崩。
-   */
   /** 解析反应变化并转给上层；解析不出来就静默丢掉，不能影响消息处理。 */
   private handleReactionUpdate(update: any): void {
     const handler = this.handlers?.onReaction;
     if (!handler) return;
-    const parsed = parseReactionUpdate(update, (peer) => peerIdOf({ peerId: peer }));
+    const parsed = parseReactionUpdate(update, (peer) => {
+      const base = peerIdOf({ peerId: peer });
+      return { id: base.id, kind: this.resolveChatKind(undefined, base.id, base.kind) };
+    });
     if (!parsed) {
       this.log.debug('反应更新解析不出来（忽略）', { className: String(update?.className ?? '') });
       return;
@@ -447,7 +564,9 @@ export class MtprotoClient implements MtprotoPort {
     if (!raw) return;
     let msg: Msg;
     try {
-      msg = toMsg(raw);
+      const parsed = toMsg(raw);
+      const chatKind = this.resolveChatKind(raw, parsed.chatId, parsed.chatKind, event?.chat);
+      msg = chatKind === parsed.chatKind ? parsed : { ...parsed, chatKind };
     } catch (error) {
       this.log.warn('消息解析失败', { reason: error instanceof Error ? error.message : String(error) });
       return;
@@ -461,10 +580,13 @@ export class MtprotoClient implements MtprotoPort {
     const verdict = this.tracker.classify({ chatId: msg.chatId, messageId: msg.id, out: msg.out });
     if (verdict.verdict === 'hold') {
       const token = verdict.token!;
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        this.holdTimers.delete(timer);
         // resolve 只会给 ours / self，不会给 hold
         this.emit(this.tracker.resolve(token), msg);
       }, 2100);
+      timer.unref?.();
+      this.holdTimers.add(timer);
       return;
     }
     this.emit(verdict.verdict, msg);
@@ -481,7 +603,7 @@ export class MtprotoClient implements MtprotoPort {
 
   async history(chat: ChatRef, opts: HistoryOptions = {}): Promise<Msg[]> {
     const client = this.ensureClient();
-    const limit = Math.max(1, Math.min(200, opts.limit ?? 30));
+    const limit = Math.max(1, Math.min(opts.topicId ? 100 : 900, opts.limit ?? 30));
     const entity = await this.guard(() => client.getInputEntity(chat.id));
 
     // 论坛话题要用 getReplies 读（普通 getHistory 会混进别的会话）
@@ -539,39 +661,66 @@ export class MtprotoClient implements MtprotoPort {
     await this.limiter.acquire(chat.id);
     const peer = await this.guard(() => client.getInputEntity(chat.id));
     const randomId = randomLong();
+    const randomKey = randomId.toString();
     // 关键：注册必须在 invoke 之前（PLAN §13.4）
     this.tracker.registerSend(randomId, chat.id);
 
+    let arrivedId = 0;
+    let resolveWaiter: ((id: number) => void) = () => {};
     const idPromise = new Promise<number>((resolve) => {
-      this.idWaiters.set(randomId.toString(), resolve);
-      setTimeout(() => {
-        if (this.idWaiters.delete(randomId.toString())) resolve(0);
-      }, 1500);
+      resolveWaiter = resolve;
+      this.idWaiters.set(randomKey, (id: number) => {
+        arrivedId = id;
+        resolve(id);
+      });
     });
 
+    // MTProto 规范：发到论坛话题但不引用具体消息时，replyToMsgId 必须等于 topicId（不能传 0）
     const replyTo = opts.replyToId || opts.topicId
       ? new Api.InputReplyToMessage({
-          replyToMsgId: opts.replyToId ?? 0,
+          replyToMsgId: opts.replyToId ?? opts.topicId ?? 0,
           ...(opts.topicId ? { topMsgId: opts.topicId } : {}),
         })
       : undefined;
 
-    const result = await this.guard(() =>
-      client.invoke(
-        new Api.messages.SendMessage({
-          peer,
-          message: body,
-          randomId,
-          noWebpage: opts.linkPreview === false,
-          silent: !!opts.silent,
-          ...(replyTo ? { replyTo } : {}),
-        }),
-      ),
-    );
+    let result: any;
+    try {
+      result = await this.guard(() =>
+        client.invoke(
+          new Api.messages.SendMessage({
+            peer,
+            message: body,
+            randomId,
+            noWebpage: opts.linkPreview === false,
+            silent: !!opts.silent,
+            ...(replyTo ? { replyTo } : {}),
+          }),
+        ),
+      );
+    } catch (error) {
+      this.idWaiters.delete(randomKey);
+      resolveWaiter(0);
+      this.tracker.cancelSend(randomId);
+      throw error;
+    }
 
     const fromResult = extractMessageId(result);
-    if (fromResult > 0) this.tracker.onMessageId(randomId, fromResult);
-    const messageId = fromResult > 0 ? fromResult : await idPromise;
+    if (fromResult > 0) {
+      this.idWaiters.delete(randomKey);
+      resolveWaiter(fromResult);
+      this.tracker.onMessageId(randomId, fromResult);
+    }
+
+    let messageId = fromResult || arrivedId;
+    if (messageId <= 0) {
+      // 超时计时从 invoke 返回后才起算，避免 FloodWait 期间提前过期
+      const timer = setTimeout(() => {
+        if (this.idWaiters.delete(randomKey)) resolveWaiter(0);
+      }, 1500);
+      timer.unref?.();
+      messageId = await idPromise;
+      clearTimeout(timer);
+    }
     if (messageId <= 0) {
       this.log.warn('发送成功但没拿到 message id', { chatId: chat.id });
     }
@@ -595,6 +744,7 @@ export class MtprotoClient implements MtprotoPort {
       if (!entity) continue;
       const mapped = mapEntity(entity);
       if (!mapped) continue;
+      this.rememberChatKind(mapped.id, mapped.kind);
       const last = dialog.message;
       out.push({
         chat: { id: mapped.id, kind: mapped.kind, title: mapped.title },
@@ -605,7 +755,11 @@ export class MtprotoClient implements MtprotoPort {
         ...(mapped.bot ? { bot: true } : {}),
       });
     }
-    this.dialogsCache = { at: Date.now(), list: out };
+    // 避免小 limit（例如环境变量每分钟刷 20 条）覆盖掉按名搜索所需的 120 条缓存
+    const now = Date.now();
+    if (!this.dialogsCache || now - this.dialogsCache.at >= 120_000 || out.length >= this.dialogsCache.list.length) {
+      this.dialogsCache = { at: now, list: out };
+    }
     return out;
   }
 
@@ -637,25 +791,26 @@ export class MtprotoClient implements MtprotoPort {
     const base = mapEntity(entity);
     if (!base) throw new Error(`拿不到会话 ${chat.id} 的资料`);
     const info: ChatInfo = { id: base.id, kind: base.kind, title: base.title };
+    this.rememberChatKind(base.id, base.kind);
     if (base.username) info.username = base.username;
 
     // 详情（简介/人数/是否论坛）能拿就拿，拿不到不算失败——权限不足是常态
     try {
       if (entity?.className === 'Channel') {
         const input = new Api.InputChannel({ channelId: entity.id, accessHash: entity.accessHash });
-        const full = await client.invoke(new Api.channels.GetFullChannel({ channel: input }));
+        const full = (await this.guard(() => client.invoke(new Api.channels.GetFullChannel({ channel: input })))) as any;
         const chatFull = full?.fullChat;
         if (chatFull?.about) info.about = String(chatFull.about);
         if (chatFull?.participantsCount) info.membersCount = Number(chatFull.participantsCount);
         if (chatFull?.forum) info.isForum = true;
       } else if (entity?.className === 'Chat') {
-        const full = await client.invoke(new Api.messages.GetFullChat({ chatId: entity.id }));
+        const full = (await this.guard(() => client.invoke(new Api.messages.GetFullChat({ chatId: entity.id })))) as any;
         const chatFull = full?.fullChat;
         if (chatFull?.about) info.about = String(chatFull.about);
         if (chatFull?.participantsCount) info.membersCount = Number(chatFull.participantsCount);
       } else if (entity?.className === 'User') {
         const input = new Api.InputUser({ userId: entity.id, accessHash: entity.accessHash });
-        const full = await client.invoke(new Api.users.GetFullUser({ id: input }));
+        const full = (await this.guard(() => client.invoke(new Api.users.GetFullUser({ id: input })))) as any;
         if (full?.fullUser?.about) info.about = String(full.fullUser.about);
       }
     } catch (error) {
@@ -734,9 +889,17 @@ export class MtprotoClient implements MtprotoPort {
 
     const client = this.ensureClient();
     try {
-      const res = await client.invoke(new Api.contacts.Search({ q: raw, limit: 20 }));
-      for (const user of res?.users ?? []) push(mapEntity(user));
-      for (const chat of res?.chats ?? []) push(mapEntity(chat));
+      const res = (await this.guard(() => client.invoke(new Api.contacts.Search({ q: raw, limit: 20 })))) as any;
+      for (const user of res?.users ?? []) {
+        const mapped = mapEntity(user);
+        if (mapped) this.rememberChatKind(mapped.id, mapped.kind);
+        push(mapped);
+      }
+      for (const chat of res?.chats ?? []) {
+        const mapped = mapEntity(chat);
+        if (mapped) this.rememberChatKind(mapped.id, mapped.kind);
+        push(mapped);
+      }
     } catch (error) {
       this.log.debug('contacts.Search 失败', { reason: String(error) });
     }
@@ -752,9 +915,11 @@ export class MtprotoClient implements MtprotoPort {
   private async tryResolveUsername(username: string): Promise<PeerCandidate | null> {
     const client = this.ensureClient();
     try {
-      const res = await client.invoke(new Api.contacts.ResolveUsername({ username }));
+      const res = (await this.guard(() => client.invoke(new Api.contacts.ResolveUsername({ username })))) as any;
       const entity = res?.chats?.[0] ?? res?.users?.[0];
-      return entity ? mapEntity(entity) : null;
+      const mapped = entity ? mapEntity(entity) : null;
+      if (mapped) this.rememberChatKind(mapped.id, mapped.kind);
+      return mapped;
     } catch (error) {
       this.log.debug('ResolveUsername 失败', { username, reason: String(error) });
       return null;
@@ -767,11 +932,14 @@ export class MtprotoClient implements MtprotoPort {
     const client = this.ensureClient();
     const forum = forumTopics();
     if (!forum) throw new UnsupportedError('P5', '论坛话题（当前 MTProto 库缺 channels/messages.GetForumTopics）');
-    const input = await this.inputChannel(chat.id);
+    // teleproto 新 layer 的 messages.GetForumTopics 参数名为 peer，老 layer 的 channels.GetForumTopics 为 channel
+    const targetParam = forum.ns === 'messages'
+      ? { peer: await this.guard(() => client.getInputEntity(chat.id)) }
+      : { channel: await this.inputChannel(chat.id) };
     const result = (await this.guard(() =>
       client.invoke(
         new forum.get({
-          channel: input,
+          ...targetParam,
           offsetDate: 0,
           offsetId: 0,
           offsetTopic: 0,
@@ -870,10 +1038,13 @@ export class MtprotoClient implements MtprotoPort {
     const out: SentRef[] = [];
     for (const update of result?.updates ?? []) {
       const message = update?.message;
-      if (update?.className === 'UpdateNewMessage' && message?.id) {
+      const cls = update?.className;
+      if ((cls === 'UpdateNewMessage' || cls === 'UpdateNewChannelMessage') && message?.id) {
+        const msgId = Number(message.id);
+        this.tracker.recordSentId(to.id, msgId);
         out.push({
           chatId: to.id,
-          messageId: Number(message.id),
+          messageId: msgId,
           randomId: 0n,
           date: Number(message.date ?? Math.floor(nowMs() / 1000)),
         });
@@ -981,7 +1152,16 @@ export class MtprotoClient implements MtprotoPort {
     let mime = info.mime;
     if (!mime || !isViewableImage(mime)) {
       try {
-        const head = new Uint8Array(readFileSync(path).subarray(0, 12));
+        // 只读前 12 字节嗅探魔术头，避免把几百 MB–2 GB 视频/压缩包整文件同步读进内存
+        const buf = Buffer.alloc(12);
+        const fd = openSync(path, 'r');
+        let n = 0;
+        try {
+          n = readSync(fd, buf, 0, 12, 0);
+        } finally {
+          closeSync(fd);
+        }
+        const head = new Uint8Array(buf.subarray(0, n));
         const sniffed = sniffImageMime(head);
         if (sniffed) {
           mime = sniffed;
@@ -1036,7 +1216,7 @@ export class MtprotoClient implements MtprotoPort {
     const msg = list?.[0];
     if (!msg?.media) return null;
     try {
-      const buffer = (await client.downloadMedia(msg, { thumb: 0 })) as unknown as Uint8Array | undefined;
+      const buffer = (await this.guard(() => client.downloadMedia(msg, { thumb: 0 }))) as unknown as Uint8Array | undefined;
       if (!buffer || buffer.length === 0) return null;
       const bytes = new Uint8Array(buffer);
       const mime = sniffImageMime(bytes) ?? 'image/jpeg';
@@ -1071,7 +1251,10 @@ export class MtprotoClient implements MtprotoPort {
     const out: SentRef[] = [];
     for (const item of items) {
       const id = Number(item?.id ?? 0);
-      if (id > 0) out.push({ chatId: chat.id, messageId: id, randomId: 0n, date: Math.floor(nowMs() / 1000) });
+      if (id > 0) {
+        this.tracker.recordSentId(chat.id, id);
+        out.push({ chatId: chat.id, messageId: id, randomId: 0n, date: Math.floor(nowMs() / 1000) });
+      }
     }
     return out;
   }
@@ -1100,16 +1283,22 @@ export class MtprotoClient implements MtprotoPort {
     const randomId = randomLong();
     this.tracker.registerSend(randomId, chat.id);
 
-    const result = await this.guard(() =>
-      client.sendFile(peer, {
-        file: sendPath,
-        ...(opts.caption ? { caption: opts.caption } : {}),
-        ...(opts.asVoice ? { voiceNote: true } : {}),
-        ...(opts.forceDocument ? { forceDocument: true } : {}),
-        ...(opts.replyToId ? { replyTo: opts.replyToId } : {}),
-        supportsStreaming: true,
-      }),
-    );
+    let result: any;
+    try {
+      result = await this.guard(() =>
+        client.sendFile(peer, {
+          file: sendPath,
+          ...(opts.caption ? { caption: opts.caption } : {}),
+          ...(opts.asVoice ? { voiceNote: true } : {}),
+          ...(opts.forceDocument ? { forceDocument: true } : {}),
+          ...(opts.replyToId ? { replyTo: opts.replyToId } : {}),
+          supportsStreaming: true,
+        }),
+      );
+    } catch (error) {
+      this.tracker.cancelSend(randomId);
+      throw error;
+    }
     const messageId = Number((result as any)?.id ?? 0);
     // 高层 sendFile 内部自己生成 random_id，我们拿不到；但 RPC 返回值带 message id，
     // 用它认领 sentIds 同样能立刻结束隔离队列里的等待（PLAN §13.4 第 1 层）。
@@ -1180,17 +1369,23 @@ export class MtprotoClient implements MtprotoPort {
     const randomId = randomLong();
     this.tracker.registerSend(randomId, chat.id);
 
-    const result = await this.guard(() =>
-      client.invoke(
-        new Api.messages.SendMedia({
-          peer,
-          media: new Api.InputMediaDocument({ id: inputDocumentOf(sticker) }),
-          message: '',
-          randomId,
-          ...(replyToId ? { replyTo: new Api.InputReplyToMessage({ replyToMsgId: replyToId }) } : {}),
-        }),
-      ),
-    );
+    let result: any;
+    try {
+      result = await this.guard(() =>
+        client.invoke(
+          new Api.messages.SendMedia({
+            peer,
+            media: new Api.InputMediaDocument({ id: inputDocumentOf(sticker) }),
+            message: '',
+            randomId,
+            ...(replyToId ? { replyTo: new Api.InputReplyToMessage({ replyToMsgId: replyToId }) } : {}),
+          }),
+        ),
+      );
+    } catch (error) {
+      this.tracker.cancelSend(randomId);
+      throw error;
+    }
     const messageId = extractMessageId(result);
     if (messageId > 0) this.tracker.onMessageId(randomId, messageId);
     return { chatId: chat.id, messageId, randomId, date: Math.floor(nowMs() / 1000) };
@@ -1237,16 +1432,22 @@ export class MtprotoClient implements MtprotoPort {
       }));
     }
 
-    const result = await this.guard(() =>
-      client.sendFile(peer, {
-        file: filePath,
-        forceDocument: true,
-        mimeType: ext === '.webm' ? 'video/webm' : ext === '.tgs' ? 'application/x-tgsticker' : ext === '.webp' ? 'image/webp' : 'image/png',
-        attributes,
-        supportsStreaming: true,
-        ...(opts.replyToId ? { replyTo: opts.replyToId } : {}),
-      }),
-    );
+    let result: any;
+    try {
+      result = await this.guard(() =>
+        client.sendFile(peer, {
+          file: filePath,
+          forceDocument: true,
+          mimeType: ext === '.webm' ? 'video/webm' : ext === '.tgs' ? 'application/x-tgsticker' : ext === '.webp' ? 'image/webp' : 'image/png',
+          attributes,
+          supportsStreaming: true,
+          ...(opts.replyToId ? { replyTo: opts.replyToId } : {}),
+        }),
+      );
+    } catch (error) {
+      this.tracker.cancelSend(randomId);
+      throw error;
+    }
     const messageId = Number((result as any)?.id ?? 0);
     if (messageId > 0) this.tracker.onMessageId(randomId, messageId);
     return { chatId: chat.id, messageId, randomId, date: Math.floor(nowMs() / 1000) };
@@ -1324,7 +1525,16 @@ export class MtprotoClient implements MtprotoPort {
     )) as any;
 
     const usable = ((result?.results ?? []) as any[]).filter((item) => !!item?.document);
-    this.gifCache.set(q, { at: Date.now(), results: usable });
+    const now = Date.now();
+    for (const [key, val] of this.gifCache) {
+      if (now - val.at >= 120_000) this.gifCache.delete(key);
+    }
+    this.gifCache.set(q, { at: now, results: usable });
+    while (this.gifCache.size > 50) {
+      const oldest = this.gifCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.gifCache.delete(oldest);
+    }
     return usable;
   }
 
@@ -1359,22 +1569,28 @@ export class MtprotoClient implements MtprotoPort {
     const randomId = randomLong();
     this.tracker.registerSend(randomId, chat.id);
 
-    const result = await this.guard(() =>
-      client.invoke(
-        new Api.messages.SendMedia({
-          peer,
-          media: new Api.InputMediaDocument({
-            id: new Api.InputDocument({
-              id: doc.id,
-              accessHash: doc.accessHash,
-              fileReference: doc.fileReference,
+    let result: any;
+    try {
+      result = await this.guard(() =>
+        client.invoke(
+          new Api.messages.SendMedia({
+            peer,
+            media: new Api.InputMediaDocument({
+              id: new Api.InputDocument({
+                id: doc.id,
+                accessHash: doc.accessHash,
+                fileReference: doc.fileReference,
+              }),
             }),
+            message: '',
+            randomId,
           }),
-          message: '',
-          randomId,
-        }),
-      ),
-    );
+        ),
+      );
+    } catch (error) {
+      this.tracker.cancelSend(randomId);
+      throw error;
+    }
     const messageId = extractMessageId(result);
     if (messageId > 0) this.tracker.onMessageId(randomId, messageId);
     const title = String(picked.title ?? '').trim();
@@ -1646,7 +1862,8 @@ export function extractMessageId(result: any): number {
   if (Array.isArray(result.updates)) {
     for (const update of result.updates) {
       if (update?.className === 'UpdateMessageID') return Number(update.id) || 0;
-      if (update?.className === 'UpdateNewMessage' && update.message?.out) {
+      const cls = update?.className;
+      if ((cls === 'UpdateNewMessage' || cls === 'UpdateNewChannelMessage') && update.message?.out) {
         return Number(update.message.id) || 0;
       }
     }
@@ -1654,7 +1871,7 @@ export function extractMessageId(result: any): number {
   return 0;
 }
 
-/** 把 peer 归一化成有符号 chat id（channel = -100xxxx，group = -xxx）。 */
+/** 把 peer 归一化成有符号 chat id（channel/supergroup = -100xxxx，group = -xxx）。 */
 export function peerIdOf(raw: any): { id: number; kind: Msg['chatKind'] } {
   const peer = raw?.peerId;
   const className = String(peer?.className ?? '');
@@ -1669,15 +1886,25 @@ export function peerIdOf(raw: any): { id: number; kind: Msg['chatKind'] } {
     if (raw?.chatId !== undefined) id = Number(raw.chatId);
     else if (raw?.senderId !== undefined) id = Number(raw.senderId);
   }
-  const kind: Msg['chatKind'] = className === 'PeerUser'
-    ? 'user'
-    : className === 'PeerChat'
-      ? 'group'
-      : className === 'PeerChannel'
-        ? 'channel'
-        : id < 0
-          ? 'group'
-          : 'user';
+  let kind: Msg['chatKind'];
+  if (className === 'PeerUser') {
+    kind = 'user';
+  } else if (className === 'PeerChat') {
+    kind = 'group';
+  } else if (className === 'PeerChannel') {
+    // 超级群与广播频道都用 PeerChannel：优先看附带实体 megagroup，其次看消息标志（频道帖 post=true，超级群消息有发言人且 post!=true）
+    if (raw?.chat?.className === 'Channel') {
+      kind = raw.chat.megagroup === true ? 'group' : 'channel';
+    } else if (raw?.post === true) {
+      kind = 'channel';
+    } else if (raw?.fromId || raw?.senderId !== undefined) {
+      kind = 'group';
+    } else {
+      kind = 'channel';
+    }
+  } else {
+    kind = id < 0 ? 'group' : 'user';
+  }
   return { id, kind };
 }
 
@@ -2002,10 +2229,11 @@ export function mentionsUser(raw: any, selfId: number, selfUsername?: string): b
       if (uid > 0 && uid === selfId) return true;
     }
   }
-  // 兜底：文本里出现 @本账号用户名（部分客户端不带 entity）
+  // 兜底：文本里出现 @本账号用户名（部分客户端不带 entity）；用词边界避免 @alice 误命中 @alice_bot / a@alice.com
   if (selfUsername) {
-    const needle = '@' + selfUsername.toLowerCase();
-    if (String(raw?.message ?? '').toLowerCase().includes(needle)) return true;
+    const escaped = selfUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?:^|[^\\w.])@${escaped}(?=$|[^\\w])`, 'i');
+    if (re.test(String(raw?.message ?? ''))) return true;
   }
   return false;
 }

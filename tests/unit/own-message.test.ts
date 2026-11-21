@@ -81,6 +81,15 @@ console.log('\n# 其它分支');
   t.onMessageId(666n, 77);
   eq('第一次', t.classify({ chatId: CHAT_A, messageId: 77, out: true }, T0 + 10).verdict, 'ours');
   eq('第二次仍是 ours（不会变成 self）', t.classify({ chatId: CHAT_A, messageId: 77, out: true }, T0 + 20).verdict, 'ours');
+  // 跨群同号他人消息绝不能误判成 ours
+  eq('跨群同 messageId 的他人消息判 incoming', t.classify({ chatId: CHAT_B, messageId: 77, out: false }, T0 + 25).verdict, 'incoming');
+}
+{
+  // 发送失败时回滚预登记，避免后续 Desktop 自发消息被误判为我方
+  const t = new SentTracker();
+  t.registerSend(888n, CHAT_A, T0);
+  t.cancelSend(888n);
+  eq('cancelSend 后不再压住', t.classify({ chatId: CHAT_A, messageId: 88, out: true }, T0 + 10).verdict, 'self');
 }
 
 console.log('\n# 清理与泄漏');

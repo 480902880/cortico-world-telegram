@@ -63,6 +63,8 @@ try {
   {
     const env = resolveForSend(join(pics, '.env'), policy);
     ok('.env 拒绝', !env.ok);
+    writeFileSync(join(pics, '.env.staging'), 'SECRET=2');
+    ok('.env.staging 同样拒绝', !resolveForSend(join(pics, '.env.staging'), policy).ok);
     const pem = resolveForSend(join(pics, 'key.pem'), policy);
     ok('.pem 拒绝', !pem.ok);
   }
