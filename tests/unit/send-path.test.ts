@@ -123,6 +123,25 @@ try {
     ok('不泄露完整路径', !missing.ok && missing.error === '文件不存在', missing.ok ? '' : missing.error);
   }
 
+  console.log('\n# 别名/短路径/联接父目录下的不存在文件（回归 Windows RUNNER~1）');
+  {
+    const aliasDir = join(root, 'pics-alias');
+    const escapeLink = join(pics, 'escape-dir');
+    try {
+      const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+      symlinkSync(pics, aliasDir, linkType);
+      symlinkSync(dataDir, escapeLink, linkType);
+      const viaAliasRoot = resolveForSend(join(aliasDir, 'nope.png'), { roots: [aliasDir], denyDirs: [] });
+      ok('别名根目录内缺失文件报「文件不存在」而非越权', !viaAliasRoot.ok && viaAliasRoot.error === '文件不存在', viaAliasRoot.ok ? '' : viaAliasRoot.error);
+      const viaRealRoot = resolveForSend(join(aliasDir, 'nope.png'), { roots: [pics], denyDirs: [] });
+      ok('通过别名访问授权目录内缺失文件同样报「文件不存在」', !viaRealRoot.ok && viaRealRoot.error === '文件不存在', viaRealRoot.ok ? '' : viaRealRoot.error);
+      const escapeMissing = resolveForSend(join(escapeLink, 'nope.png'), { roots: [pics], denyDirs: [] });
+      ok('联接指向授权目录外时即使文件不存在也按越权拒绝', !escapeMissing.ok && escapeMissing.error === '该路径不在授权的资源目录内', escapeMissing.ok ? '' : escapeMissing.error);
+    } catch {
+      ok('目录联接用例跳过（无权限）', true);
+    }
+  }
+
   console.log('\n# roots = null（阶段二给主人用）');
   {
     const anywhere = resolveForSend(join(pics, 'a.png'), { roots: null, denyDirs: [] });

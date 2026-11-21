@@ -11,7 +11,7 @@
  */
 
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { basename, extname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 
 export type ResourceKind = 'voice' | 'song' | 'image' | 'video' | 'file' | 'sticker' | 'download';
 
@@ -113,23 +113,42 @@ export interface DirStatus {
   newest?: ResourceFile;
 }
 
-function realOf(path: string): string {
-  let real: string;
-  try {
-    // native 版本会展开 8.3 短名与符号链接；Windows 下大小写不敏感
-    real = realpathSync.native(path);
-  } catch {
-    real = resolve(path);
+/**
+ * 返回规范化的真实路径；目标本身不存在时向上回溯到最近的存在祖先做 realpath，
+ * 再拼回剩余路径段。避免 Windows 8.3 短路径（如 `C:\Users\RUNNER~1\...`）或符号链接/联接父目录
+ * 导致「存在目录已展开、缺失文件未展开」的比较错配。
+ */
+export function realPathPrefix(path: string): string {
+  const abs = resolve(path);
+  let cur = abs;
+  const tail: string[] = [];
+  let real: string | null = null;
+  while (true) {
+    try {
+      // native 版本会展开 8.3 短名与符号链接；Windows 下大小写不敏感
+      real = realpathSync.native(cur);
+      break;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) break;
+      tail.push(basename(cur));
+      cur = parent;
+    }
   }
-  return process.platform === 'win32' ? real.toLowerCase() : real;
+  const combined = real !== null
+    ? (tail.length ? join(real, ...tail.reverse()) : real)
+    : abs;
+  return process.platform === 'win32' ? combined.toLowerCase() : combined;
 }
 
-function isInside(target: string, root: string): boolean {
-  const t = realOf(target);
-  const r = realOf(root);
+export function isPathInside(target: string, root: string): boolean {
+  const t = realPathPrefix(target);
+  const r = realPathPrefix(root);
   if (t === r) return true;
   return t.startsWith(r.endsWith(sep) ? r : `${r}${sep}`);
 }
+
+const isInside = isPathInside;
 
 /** 无论在哪都不许外发的文件名（等于账号控制权，或凭据）。 */
 const DENY_BASENAMES = new Set([

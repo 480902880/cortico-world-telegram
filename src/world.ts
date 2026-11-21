@@ -9,7 +9,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Logger, StoragePart, ToolDef, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
@@ -54,7 +54,9 @@ import {
   ResourceIndex,
   describeResource,
   inspectAll,
+  isPathInside,
   kindOfFile,
+  realPathPrefix,
   resolveForSend,
   resolveWithinRoots,
   type SendPathPolicy,
@@ -601,17 +603,7 @@ export class TelegramWorld implements World {
   private isSongDirPath(path: string): boolean {
     const dir = this.resourceDirs().song;
     if (!dir) return false;
-    const canon = (value: string): string => {
-      let target = resolve(value);
-      try {
-        target = realpathSync.native(target);
-      } catch {
-        // 路径不存在时退回 resolve
-      }
-      const unified = target.replace(/\\/g, '/').replace(/\/+$/, '');
-      return process.platform === 'win32' ? unified.toLowerCase() : unified;
-    };
-    return canon(path).startsWith(`${canon(dir)}/`);
+    return isPathInside(path, dir) && realPathPrefix(path) !== realPathPrefix(dir);
   }
 
   /** 发消息前的统一闸门：被 PEER_FLOOD 罚站时只放行白名单会话。 */
