@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## 0.44.1 — 凭据保存与重启修复 + 路径归属校验加固
+
+### 凭据与重启修复
+- **修复自定义 `api_id / api_hash` 切换后无法重启扩展的死锁**：`setCredentials()` 之前会把 `apiId` 单独写入 `config.json`（不写 `apiHash`），导致重启 World 或重新启用扩展时触发 `填了 api_id 但没填 api_hash（两者必须成对）` 报错而无法启动。现改为：
+  - 保存前先通过 `resolveCredentials()` 前置校验 `api_id`（正整数）与 `api_hash`（32 位十六进制），非法输入直接拒绝而不写入脏数据。
+  - 将 `TG_API_ID` 与 `TG_API_HASH` 成对写入部署 `.env`（`ctx.storeSecret`），并清空 `config.json` 中残留的 `apiId` / `apiHash`（`0` / `''`），避免明文 `api_hash` 落入 `config.json` 或残留半对字段。
+- **修复完整重启 Coopanion 后 `.env` 凭据失效回退内置凭据**：`definition.ts`（`preflight`）与 `world.ts`（`start()`）解析凭据时改为通过 `ctx.secret(name) || process.env[name]` 读取部署 `.env`，不再因只查 `process.env` 而静默回退到内置 `api_id=2040`。
+- **兼容旧版残留配置自动修复**：从 `0.44.0` 升级时若 `config.json` 仍残留孤立 `apiId`（无 `apiHash`），且 `.env` 已存在同号 `TG_API_ID` 与合法 32 位十六进制 `TG_API_HASH`，`resolveCredentials()` 自动以 `.env` 凭据兼容启动。
+- **登录前即可在面板切换凭据**：登录页将「凭据（`api_id / api_hash`）」卡片抽离并在未登录 / 报错 / 失效态与已登录态同时展示，保存成功后自动清空 `api_hash` 输入框明文，支持先填入自己的凭据 → 保存 → 重启 World 再登录。
+- **停机清理凭据状态**：`stop()` 时一并清空内存中的 `auth` 与 `credentials` 缓存，防止重启前后残留旧状态。
+
+### 路径归属校验与测试
+- **修复 Windows 8.3 短路径与联接父目录下缺失文件的路径归属校验**（`src/resources.ts`、`src/world.ts`）：新增 `realPathPrefix()` / `isPathInside()`，目标文件尚未创建时向上回溯到最近存在的祖先目录执行 `realpathSync.native` 再拼回剩余路径段，消除「目录已展开、缺失文件未展开」的比较错配。
+- 补齐 `tests/unit/credentials.test.ts`、`tests/lifecycle.ts`、`tests/unit/send-path.test.ts` 对应回归用例。
+
 ## 0.44.0 — 自动跟随系统代理 + 稳定性与安全全面修复
 
 ### 网络与代理

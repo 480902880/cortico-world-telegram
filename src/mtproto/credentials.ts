@@ -68,11 +68,22 @@ export function resolveCredentials(input: CredentialInput = {}): ResolveResult {
 
   const cfgId = parseId(input.apiId);
   const cfgHash = (input.apiHash ?? '').trim();
+  const envId = parseId(env('TG_API_ID'));
+  const envHash = (env('TG_API_HASH') ?? '').trim();
+
   if (cfgId || cfgHash) {
     if (!cfgId && cfgHash) {
       return { ok: false, error: '填了 api_hash 但没填 api_id（两者必须成对）', detail: '两者必须成对出现' };
     }
     if (cfgId && !cfgHash) {
+      // 兼容旧版 setCredentials 曾把 apiId 单独写进 config.json、把成对凭据写进 .env 的残留状态：
+      // 只要 .env 里存在同一个 api_id 且配对的 32 位 api_hash，直接平滑走 .env，避免升级/重启死锁。
+      if (envId === cfgId && envHash && looksLikeHash(envHash)) {
+        return {
+          ok: true,
+          value: { apiId: envId, apiHash: envHash, source: 'env', label: '部署 .env（TG_API_ID / TG_API_HASH）' },
+        };
+      }
       return { ok: false, error: '填了 api_id 但没填 api_hash（两者必须成对）', detail: '两者必须成对出现' };
     }
     if (!looksLikeHash(cfgHash)) {
@@ -84,8 +95,6 @@ export function resolveCredentials(input: CredentialInput = {}): ResolveResult {
     };
   }
 
-  const envId = parseId(env('TG_API_ID'));
-  const envHash = (env('TG_API_HASH') ?? '').trim();
   if (envId && envHash) {
     if (!looksLikeHash(envHash)) {
       return { ok: false, error: '.env 里的 TG_API_HASH 格式不对', detail: '应为 32 位十六进制' };

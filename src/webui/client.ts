@@ -439,7 +439,7 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
           return;
         }
 
-        // idle / error / revoked：手机号入口
+        // idle / error / revoked：手机号入口（同时提供凭据卡片，避免内置凭据限流或未登录时无法改 api_id / api_hash）
         const phone = field('手机号', { placeholder: '+8613800138000' });
         const send = el('button', BUTTON, '发送验证码');
         send.onclick = async () => {
@@ -452,7 +452,45 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         if (step === 'revoked') {
           card.append(el('div', { ...LABEL, color: '#e2564a' }, '上一次的会话已被其他设备终止，需要重新登录。'));
         }
-        body.append(card);
+        body.append(card, credentialsCard(status, call, () => refresh(true)));
+      };
+
+      const credentialsCard = (
+        status: PanelStatus,
+        invoke: (m: string, a?: unknown[]) => Promise<any | null>,
+        reload: () => Promise<void>,
+      ): HTMLElement => {
+        const cred = el('div', CARD);
+        const apiId = field('api_id', { value: String(status.credentials.apiId || '') });
+        const apiHash = field('api_hash', { placeholder: status.credentials.apiHashMasked || '32 位十六进制' });
+        const saveCred = el('button', BUTTON, '保存凭据');
+        saveCred.onclick = async () => {
+          const res = await invoke('set_credentials', [apiId.value, apiHash.value]);
+          if (res) {
+            apiHash.value = '';
+            await reload();
+          }
+        };
+        const restart = el('button', BUTTON, '重启 World');
+        restart.onclick = async () => {
+          const res = await invoke('restart');
+          if (res) await reload();
+        };
+        const hint = el('div', { ...LABEL, display: status.needsRestart ? 'block' : 'none' }, '凭据已保存，重启 World 后生效。');
+        hint.dataset.role = 'restart-hint';
+        cred.append(
+          title('凭据（api_id / api_hash）'),
+          el('div', LABEL, `当前来源：${status.credentials.label}`),
+          ...(status.credentials.source === 'builtin'
+            ? [el('div', { ...LABEL, opacity: '0.55' }, '内置凭据是公共的，可能被限流。想更稳就去 my.telegram.org 申请一份填在下面（免费，两分钟）。')]
+            : []),
+          labeled('api_id', apiId),
+          labeled('api_hash（与 api_id 成对填写）', apiHash),
+          el('div', { display: 'flex', gap: '8px' }, undefined),
+        );
+        (cred.lastElementChild as HTMLElement).append(saveCred, restart);
+        cred.append(hint);
+        return cred;
       };
 
       const authorizedSection = (
@@ -487,33 +525,7 @@ function loginPanel(): { mount(ctx: WebUiPanelContext): void } {
         };
         account.append(logout);
 
-        const cred = el('div', CARD);
-        const apiId = field('api_id', { value: String(status.credentials.apiId || '') });
-        const apiHash = field('api_hash', { placeholder: status.credentials.apiHashMasked || '32 位十六进制' });
-        const saveCred = el('button', BUTTON, '保存凭据');
-        saveCred.onclick = async () => {
-          const res = await invoke('set_credentials', [apiId.value, apiHash.value]);
-          if (res) await refresh(true);
-        };
-        const restart = el('button', BUTTON, '重启 World');
-        restart.onclick = async () => {
-          const res = await invoke('restart');
-          if (res) await refresh(true);
-        };
-        const hint = el('div', { ...LABEL, display: status.needsRestart ? 'block' : 'none' }, '凭据已保存，重启 World 后生效。');
-        hint.dataset.role = 'restart-hint';
-        cred.append(
-          title('凭据（api_id / api_hash）'),
-          el('div', LABEL, `当前来源：${status.credentials.label}`),
-          ...(status.credentials.source === 'builtin'
-            ? [el('div', { ...LABEL, opacity: '0.55' }, '内置凭据是公共的，可能被限流。想更稳就去 my.telegram.org 申请一份填在下面（免费，两分钟）。')]
-            : []),
-          labeled('api_id', apiId),
-          labeled('api_hash（与 api_id 成对填写）', apiHash),
-          el('div', { display: 'flex', gap: '8px' }, undefined),
-        );
-        (cred.lastElementChild as HTMLElement).append(saveCred, restart);
-        cred.append(hint);
+        const cred = credentialsCard(status, invoke, () => refresh(true));
 
         const allow = el('div', CARD);
         const users = el('textarea', { ...INPUT, minHeight: '54px' });

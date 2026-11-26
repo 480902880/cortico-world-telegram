@@ -169,7 +169,11 @@ export class TelegramWorld implements World {
         return;
       }
       this.audit.setEnabled(cfg.auditLog === true);
-      const resolved = resolveCredentials({ apiId: cfg.apiId, apiHash: cfg.apiHash });
+      const resolved = resolveCredentials({
+        apiId: cfg.apiId,
+        apiHash: cfg.apiHash,
+        env: (name) => this.ctx.secret(name) || process.env[name],
+      });
       if (!resolved.ok) {
         throw new Error(`${resolved.error}${resolved.detail ? `：${resolved.detail}` : ''}`);
       }
@@ -300,6 +304,8 @@ export class TelegramWorld implements World {
       await this.client?.disconnect();
     } finally {
       this.client = undefined;
+      this.auth = undefined;
+      this.credentials = undefined;
       this.lock.release();
       this.log.info('Telegram World 已停止');
     }
@@ -2333,16 +2339,22 @@ export class TelegramWorld implements World {
       },
       setCredentials: async (apiId, apiHash) => {
         const id = Number(apiId);
+        const hash = apiHash.trim();
         if (!Number.isInteger(id) || id <= 0) throw new Error('api_id 必须是正整数');
+        const check = resolveCredentials({ apiId: id, apiHash: hash, env: () => undefined });
+        if (!check.ok) {
+          throw new Error(`${check.error}${check.detail ? `：${check.detail}` : ''}`);
+        }
         try {
           this.ctx.storeSecret('TG_API_ID', String(id));
-          this.ctx.storeSecret('TG_API_HASH', apiHash);
+          this.ctx.storeSecret('TG_API_HASH', hash);
         } catch (error) {
           throw new Error(`保存凭据失败：${error instanceof Error ? error.message : String(error)}`);
         }
-        this.ctx.persist({ apiId: id });
+        // 凭据统一落到 .env，必须清掉 config.json 里可能残留的半对 apiId/apiHash，否则重启会被 preflight 拦住
+        this.ctx.persist({ apiId: 0, apiHash: '' });
         this.needsRestart = true;
-        return '凭据已写入 .env（api_id/api_hash）；需要重启 World 生效。';
+        return '凭据已写入 .env（api_id/api_hash）；点击「重启 World」即可生效。';
       },
       setAllowlist: (users, chats) => {
         const parse = (raw: string): Array<{ id: number; enabled: boolean }> => raw

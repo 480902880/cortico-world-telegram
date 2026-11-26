@@ -122,13 +122,13 @@ npm run describe      # 生成 describe.json
 
 ### api_id / api_hash
 
-三者按优先级取**一组**（必须成对）：面板填的 → 部署 `.env` 的 `TG_API_ID`/`TG_API_HASH` → **内置默认**。
+凭据必须**成对**提供，按优先级取一组：`config.json` 显式配置（`apiId` + `apiHash`）→ 部署 `.env` 的 `TG_API_ID` / `TG_API_HASH`（**面板保存写这里**）→ **内置默认**。
 
-内置默认是 Telegram Desktop 的公开凭据，**无需注册即可登录**，代价是：设备列表里这条显示成
-"Telegram Desktop"，且可能被 `API_ID_PUBLISHED_FLOOD` 限流。稳妥做法是去
-[my.telegram.org](https://my.telegram.org) 建自己的应用，面板里换上、重启 World。
+- **登录前和登录后都可以配置**：在 **Telegram → 登录** 页的「凭据（api_id / api_hash）」卡片填入从 [my.telegram.org](https://my.telegram.org) 申请的 `api_id` 与 32 位十六进制 `api_hash` → 点 **保存** → 点 **重启 World** 即可生效（无需先用内置凭据登录，也无需手工改配置）。
+- 面板保存会直接写入部署 `.env`（不会把明文 `api_hash` 写进 `config.json`），并自动清理旧配置里残留的半对字段，完整重启 Coopanion 后依然生效。
+- 不填时会使用内置默认（Telegram Desktop 的公开凭据），**无需注册即可登录**，代价是设备列表显示为 "Telegram Desktop"，且可能被 `API_ID_PUBLISHED_FLOOD` 限流；稳妥做法是换成自己的应用凭据。
 
-设备名固定为 `Coopanion Telegram World`，与 api_id 无关。
+设备名固定为 `Coopanion Telegram World`，与 `api_id` 无关。
 
 ---
 

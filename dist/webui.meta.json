@@ -1,7 +1,7 @@
 {
-  "sourceHash": "0398fcb253c40c57aeb8f308b05cc0c7",
-  "builtAt": "2026-11-21T09:32:28.385Z",
+  "sourceHash": "a64ed5707487ce525c38fc286c89c677",
+  "builtAt": "2026-11-26T18:12:22.728Z",
   "inputs": 3,
   "out": "dist/webui.js",
-  "outSize": 28629
+  "outSize": 28696
 }

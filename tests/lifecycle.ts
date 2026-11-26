@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { telegramDefaults } from '../src/config.ts';
+import { TELEGRAM } from '../src/definition.ts';
 import { TelegramWorld } from '../src/world.ts';
 
 let passed = 0;
@@ -119,6 +120,56 @@ async function main(): Promise<void> {
   await w4.webUi('zh').invoke!('login', 'set_allowlist', ['12345', '-1001234567890, -42']);
   ok('set_allowlist 保留群/频道负号', JSON.stringify(persistedAllow?.allowChats?.map((c: any) => c.id)) === JSON.stringify([-1001234567890, -42]), JSON.stringify(persistedAllow));
   await w3.stop();
+
+  console.log('\n# 回归：set_credentials 后重启 World / 重启进程能从 ctx.secret 正常启动');
+  const secrets = new Map<string, string>();
+  const credCfg: any = telegramDefaults();
+  const credCtx: any = {
+    id: 'telegram',
+    cfg: credCfg,
+    timezone: 'Asia/Shanghai',
+    botName: 'probe',
+    botDir: dataDir,
+    packageDir: dataDir,
+    dataDir,
+    repoRoot: dataDir,
+    secret: (name: string) => secrets.get(name) ?? '',
+    storeSecret: (name: string, value: string) => { secrets.set(name, value); },
+    persist: (patch: any) => { Object.assign(credCfg, patch); },
+    restart: async () => {},
+  };
+  const wCred = new TelegramWorld(credCtx);
+  await wCred.start(host as any);
+  const credInvoke = wCred.webUi('zh').invoke!;
+
+  let badHashFailed = false;
+  try {
+    await credInvoke('login', 'set_credentials', ['27858987', 'not-a-valid-hash']);
+  } catch {
+    badHashFailed = true;
+  }
+  ok('非法 api_hash 在保存阶段即被拦截', badHashFailed && secrets.size === 0);
+
+  const validHash = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  await credInvoke('login', 'set_credentials', ['27858987', validHash]);
+  ok('set_credentials 写入 .env 两项', secrets.get('TG_API_ID') === '27858987' && secrets.get('TG_API_HASH') === validHash);
+  ok('set_credentials 清空 config.json 半对残留', credCfg.apiId === 0 && credCfg.apiHash === '');
+  await wCred.stop();
+
+  // 模拟完整重启 Coopanion（process.env 不含 TG_API_*，仅通过 ctx.secret 读 .env）
+  let preflightOk = true;
+  try {
+    TELEGRAM.preflight?.(credCtx);
+  } catch {
+    preflightOk = false;
+  }
+  ok('重启后 preflight 通过 ctx.secret 校验成功', preflightOk);
+
+  const wCred2 = new TelegramWorld(credCtx);
+  await wCred2.start(host as any);
+  const st2 = (await wCred2.webUi('zh').invoke!('status', 'status', [])) as any;
+  ok('重启后生效的是 .env 里的自定义 api_id', st2?.credentials?.apiId === 27858987 && st2?.credentials?.source === 'env', JSON.stringify(st2?.credentials));
+  await wCred2.stop();
 
   console.log(`\n结果：${passed} 通过 / ${failed} 失败`);
   if (failed > 0) process.exitCode = 1;

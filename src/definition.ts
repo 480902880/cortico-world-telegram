@@ -38,7 +38,11 @@ export const TELEGRAM: WorldDefinition<TelegramConfigSection> = {
 
   /** 激活前就把凭据问题挡住，别等 start() 才炸。 */
   preflight: (ctx) => {
-    const resolved = resolveCredentials({ apiId: ctx.cfg.apiId, apiHash: ctx.cfg.apiHash });
+    const resolved = resolveCredentials({
+      apiId: ctx.cfg.apiId,
+      apiHash: ctx.cfg.apiHash,
+      env: (name) => ctx.secret(name) || process.env[name],
+    });
     if (!resolved.ok) {
       throw new Error(`${resolved.error}${resolved.detail ? `：${resolved.detail}` : ''}`);
     }

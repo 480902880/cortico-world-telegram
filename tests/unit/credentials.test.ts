@@ -70,6 +70,16 @@ console.log('\n# 非法组合');
   const r = resolveCredentials({ env });
   ok('env 只有一个 → 报错', !r.ok && (r.ok ? '' : r.error).includes('成对'));
 }
+{
+  const env = (n: string) => (n === 'TG_API_ID' ? '27858987' : n === 'TG_API_HASH' ? 'e'.repeat(32) : undefined);
+  const r = resolveCredentials({ apiId: 27858987, apiHash: '', env });
+  ok('旧版残留半对 config.apiId 与 .env 同号时自动兼容走 .env', r.ok && r.value.source === 'env' && r.value.apiId === 27858987);
+}
+{
+  const env = (n: string) => (n === 'TG_API_ID' ? '999999' : n === 'TG_API_HASH' ? 'e'.repeat(32) : undefined);
+  const r = resolveCredentials({ apiId: 27858987, apiHash: '', env });
+  ok('config.apiId 与 .env 不一致且无 apiHash → 仍报错', !r.ok);
+}
 
 console.log('\n# 掩码与指纹');
 {
